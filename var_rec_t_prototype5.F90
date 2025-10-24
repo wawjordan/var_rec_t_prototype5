@@ -173,6 +173,67 @@ contains
 
 end module timer_derived_type
 
+module quick_sort
+  implicit none
+  private
+  public :: sort
+contains
+  pure subroutine sort(array,sorted,idx)
+    integer, dimension(:),           intent(in) :: array
+    integer, dimension(size(array)), optional, intent(out) :: sorted
+    integer, dimension(:), optional, intent(inout) :: idx
+    integer, dimension(size(array)) :: idx_, sorted_
+    integer :: i, m
+    m = size(array)
+    sorted_ = array
+    if ( present(idx) ) then
+      call qsort_1D( m, sorted_, idx )
+    else
+      call qsort_1D( m, sorted_, idx_ )
+    end if
+    if ( present(sorted) ) sorted = sorted_
+  end subroutine sort
+
+  pure recursive subroutine qsort_1D( m, A, indx )
+    integer,               intent(in)    :: m
+    integer, dimension(m), intent(inout) :: A
+    integer, dimension(m), intent(inout) :: indx
+    integer :: iq
+    if ( m > 1 ) then
+      call partition_1D( m, A, indx, iq )
+      call qsort_1D( iq-1  , A(1:iq-1), indx(1:iq-1) )
+      call qsort_1D( m-iq+1, A(iq:m)  , indx(iq:m)   )
+    end if
+  end subroutine qsort_1D
+
+  pure subroutine partition_1D( m, A, indx, marker )
+    integer,               intent(in)    :: m
+    integer, dimension(m), intent(inout) :: A
+    integer, dimension(m), intent(inout) :: indx
+    integer,               intent(out)   :: marker
+    integer :: return_val
+    integer :: i, j
+    integer :: temp_indx
+    integer :: x, temp_A
+    x = A(1)
+    i = 0
+    j = m+1
+    do
+      do; j = j-1; if ( A(j) <= x ) exit; end do
+      do; i = i+1; if ( A(i) >= x ) exit; end do
+      if ( i < j ) then
+        temp_A    = A(i);   temp_indx = indx(i)
+        A(i)      = A(j);   indx(i)   = indx(j)
+        A(j)      = temp_A; indx(j)   = temp_indx
+      elseif ( i == j ) then
+        marker = i+1; return
+      else
+        marker = i; return
+      end if
+    end do
+  end subroutine partition_1D
+end module quick_sort
+
 module index_conversion
   implicit none
   private
@@ -183,6 +244,9 @@ module index_conversion
   public :: cell_face_nbors
   public :: get_face_idx_from_id
   public :: get_reshape_indices
+  public :: range_intersect, bound_intersect
+  public :: node_to_cell_idx, get_neighbor_idx
+  public :: shift_val_to_start
 
   interface cell_face_nbors
     module procedure cell_face_nbors_lin
@@ -390,6 +454,22 @@ contains
     face_idx = idx + face_offset
   end subroutine get_face_idx_from_id
 
+  subroutine get_neighbor_idx( dim, bnd1_min, bnd1_max, bnd2_min, bnd2_max, idx, out_idx )
+    integer,                 intent(in)  :: dim
+    integer, dimension(dim), intent(in)  :: bnd1_min, bnd1_max, &
+                                            bnd2_min, bnd2_max
+    integer, dimension(dim), intent(in)  :: idx
+    integer, dimension(dim), intent(out) :: out_idx
+    integer, dimension(dim) :: delta1, delta2, s1, s2, s, offset
+    delta1 = bnd1_max - bnd1_min
+    delta2 = bnd2_max - bnd2_min
+    s1 = sign(1,delta1)
+    s2 = sign(1,delta2)
+    s  = s1*s2
+    offset = idx - bnd1_min - s1
+    out_idx = bnd2_min + s*offset + s2
+end subroutine get_neighbor_idx
+
   pure subroutine get_reshape_indices( sz_in, loc, sz_out, sz_cnt, idx_start, idx_end )
     integer, dimension(:),           intent(in)  :: sz_in
     integer, dimension(size(sz_in)), intent(in)  :: loc
@@ -416,7 +496,839 @@ contains
 
   end subroutine get_reshape_indices
 
+  pure elemental function range_intersect( startA, endA, startB, endB )
+    integer, intent(in) :: startA, endA, startB, endB
+    logical             :: range_intersect
+    range_intersect = ( startA <= endB ).and.( endA >= startB )
+  end function range_intersect
+
+  pure function bound_intersect( dim, bnd1_min, bnd1_max, bnd2_min, bnd2_max )
+    integer,                 intent(in) :: dim
+    integer, dimension(dim), intent(in) :: bnd1_min, bnd1_max, &
+                                           bnd2_min, bnd2_max
+    logical                             :: bound_intersect
+    bound_intersect = all( range_intersect( bnd1_min, bnd1_max,                &
+                                            bnd2_min, bnd2_max ) )
+  end function bound_intersect
+
+  pure elemental subroutine node_to_cell_idx(bnd_min,bnd_max)
+    integer, intent(inout) :: bnd_min, bnd_max
+    if ( bnd_max > bnd_min ) then
+      bnd_max = bnd_max - 1
+    elseif (bnd_min > bnd_max ) then
+      bnd_min = bnd_min - 1
+    end if
+  end subroutine node_to_cell_idx
+
+  pure subroutine shift_val_to_start(list,idx)
+    integer, dimension(:), intent(inout) :: list
+    integer,               intent(in)    :: idx
+    integer, dimension(size(list)) :: tmp
+    integer :: i
+    tmp = list
+    list(1) = list(idx)
+    do i = 1,idx-1
+      list(i+1) = tmp(i)
+    end do
+  end subroutine shift_val_to_start
+
 end module index_conversion
+
+module stencil_indexing
+
+  implicit none
+
+  private
+
+  public :: get_linear_face_idx
+  public :: cell_offsets
+
+  public :: get_offsets
+  public :: cube_mask2dir
+  public :: mask_dim_split
+  public :: mask_in_bounds
+  
+  public :: on_3d_boundary
+  public :: is_ghost_cell
+  public :: idx_to_offset
+  public :: sort_stencil_idx
+  public :: get_interior_mask
+  public :: determine_interior_stencil_count
+
+  public :: linear_map_offsets_check
+  public :: inviscid_stencil_indices_3D
+  public :: viscous_offsets, muscl_offsets, center_offsets
+
+  public :: get_bounding_box
+
+  integer, parameter, dimension(7) :: map_idx = [5,3,1,0,2,4,6]
+  integer, parameter, dimension(3,6) :: cell_offsets = reshape(                &
+                              [-1,0,0,1,0,0,0,-1,0,0,1,0,0,0,-1,0,0,1],[3,6])
+contains
+
+pure function get_linear_face_idx( idx )
+  integer, dimension(3),   intent(in) :: idx
+  integer                             :: get_linear_face_idx
+  get_linear_face_idx = map_idx( idx(1) + 2*idx(2) + 3*idx(3) + 4 )
+end function get_linear_face_idx
+
+subroutine get_offsets(mask,offsets,n)
+  logical, dimension(6),   intent(in)  :: mask
+  integer, dimension(3,6), intent(out) :: offsets
+  integer,                 intent(out) :: n
+  integer :: i
+  offsets = 0
+  n = count(.not.mask)
+  do i = 1,3
+    offsets(i,:) = pack( cell_offsets(i,:), .not.mask,offsets(i,:) )
+  end do
+end subroutine get_offsets
+
+function cube_mask2dir(mask) result(dir)
+    logical, dimension(6), intent(in) :: mask
+    integer, dimension(3)             :: dir
+    integer, dimension(6), parameter :: ds = [-1,1,-2,2,-3,3]
+    integer, dimension(6) :: dds = 0
+    integer :: n, i, d, s
+
+    dir = 0
+    n = count(mask)
+    if (n == 0) return
+    
+    dds(1:n) = pack( ds, mask )
+    do i = 1,n
+      d = abs( dds(i) )
+      if (d/=0) then
+        s      = sign( 1, dds(i) )
+        dir(d) = dir(d) + s
+      end if
+    end do
+  end function cube_mask2dir
+
+  subroutine mask_dim_split( mask, idx, origin )
+    logical, dimension(6), intent(inout) :: mask
+    integer, dimension(3), intent(in)    :: idx, origin
+    mask(1) = mask(1).or.( idx(1) > origin(1) )
+    mask(2) = mask(2).or.( idx(1) < origin(1) )
+    mask(3) = mask(3).or.( idx(2) > origin(2) )
+    mask(4) = mask(4).or.( idx(2) < origin(2) )
+    mask(5) = mask(5).or.( idx(3) > origin(3) )
+    mask(6) = mask(6).or.( idx(3) < origin(3) )
+  end subroutine mask_dim_split
+
+  subroutine mask_in_bounds( mask, idx, lo, hi )
+    logical, dimension(6), intent(inout) :: mask
+    integer, dimension(3), intent(in)    :: idx, lo, hi
+
+    integer, dimension(3,2) :: bnds
+
+    bnds(:,1) = lo
+    bnds(:,2) = hi
+
+    mask = mask .or. on_3d_boundary( idx, bnds )
+  end subroutine mask_in_bounds
+
+  function on_3d_boundary( idx, bnds )
+    use index_conversion, only : in_bound
+    integer, dimension(3),   intent(in) :: idx
+    integer, dimension(3,2), intent(in) :: bnds
+    logical, dimension(6)               :: on_3d_boundary
+
+    integer, dimension(3,2) :: bnds_tmp
+    integer :: d, s
+
+     do d = 1,3
+      do s = 1,2
+        bnds_tmp = bnds
+        bnds_tmp(d,:) = bnds(d,s)
+        on_3d_boundary(2*(d-1)+s) = in_bound( 3, idx, bnds_tmp(:,1), bnds_tmp(:,2) )
+      end do
+    end do
+  end function on_3d_boundary
+
+  function is_ghost_cell(idx,lo,hi,n_ghost_cells) result(mask)
+    use index_conversion, only : in_bound
+    integer, dimension(3), intent(in) :: idx, lo, hi, n_ghost_cells
+    logical, dimension(6)             :: mask
+    integer, dimension(2), parameter :: dir = [-1,1]
+
+    integer, dimension(3,2) :: bnds, bnds2, bnds_tmp
+    integer :: d, s
+
+    bnds(:,1)  = lo
+    bnds(:,2)  = hi
+    bnds2(:,1) = lo - n_ghost_cells
+    bnds2(:,2) = hi + n_ghost_cells
+    mask = .false.
+    do d = 1,3
+      do s = 1,2
+        bnds_tmp = bnds2
+        bnds_tmp(d,:) = bnds(d,s) + dir(s)
+        bnds_tmp(d,s) = bnds(d,s) + dir(s) * n_ghost_cells(d)
+        mask(2*(d-1)+s) = in_bound( 3, idx, bnds_tmp(:,1), bnds_tmp(:,2) )
+      end do
+    end do
+  end function is_ghost_cell
+
+  subroutine get_interior_mask( offset_list, idx, lo_bnd, hi_bnd, interior_mask )
+    use index_conversion, only : in_bound
+    integer, dimension(:,:),            intent(in)  :: offset_list
+    integer, dimension(3),              intent(in)  :: idx, lo_bnd, hi_bnd
+    logical, dimension(:), allocatable, intent(out) :: interior_mask
+    integer :: i, N_cells
+    
+    N_cells = size(offset_list,2)
+
+    allocate( interior_mask(N_cells) )
+    interior_mask = .false.
+    do i = 1,N_cells
+      interior_mask(i) = in_bound( 3, idx + offset_list(:,i), lo_bnd, hi_bnd )
+    end do
+  end subroutine get_interior_mask
+
+  subroutine idx_to_offset( idx_list, center_idx, offset_list )
+    integer, dimension(:,:),              intent(in)  :: idx_list
+    integer, dimension(size(idx_list,1)), intent(in)  :: center_idx
+    integer, dimension(size(idx_list,1),size(idx_list,2)), intent(out)  :: offset_list
+    integer :: i
+
+    do i = 1,size(idx_list,2)
+      offset_list(:,i) = idx_list(:,i) - center_idx
+    end do
+  end subroutine idx_to_offset
+
+  subroutine get_bounding_box( idx_list, idx, bnd_min, bnd_max )
+    integer, dimension(:,:),              intent(in)  :: idx_list
+    integer, dimension(size(idx_list,1)), intent(in)  :: idx
+    integer, dimension(size(idx_list,1)), intent(out) :: bnd_min, bnd_max
+
+    bnd_min = minval(idx_list,2) + idx
+    bnd_max = maxval(idx_list,2) + idx
+
+  end subroutine get_bounding_box
+
+  subroutine determine_interior_stencil_count( idx_list, lo_bnd_in, hi_bnd_in,           &
+                                               lo_bnd_out, hi_bnd_out,                   &
+                                               offset, n_ghost, n_gc_sten )
+    integer, dimension(:,:),         intent(in)  :: idx_list
+    integer, dimension(3),           intent(in)  :: lo_bnd_in, hi_bnd_in
+    integer, dimension(3), optional, intent(in)  :: offset, n_ghost
+    integer,               optional, intent(in)  :: n_gc_sten
+    integer, dimension(3),           intent(out) :: lo_bnd_out
+    integer, dimension(3),           intent(out) :: hi_bnd_out
+    integer, dimension(3,size(idx_list,2)) :: offset_list
+    integer, dimension(3) :: idx,lo_bnd_stencil, hi_bnd_stencil, ng
+    integer :: Ncells
+    
+    Ncells = size(idx_list,2)
+    
+    if ( present(offset) ) then
+      call idx_to_offset( idx_list, offset, offset_list )
+    else
+      offset_list = idx_list
+    end if
+
+    ng  = 0
+    if ( present(n_ghost) )   ng = n_ghost
+    if ( present(n_gc_sten) ) ng = max(ng-n_gc_sten,0)
+
+    idx = 0
+    call get_bounding_box( offset_list, idx, lo_bnd_stencil, hi_bnd_stencil )
+
+    lo_bnd_out = lo_bnd_in - lo_bnd_stencil - ng
+    hi_bnd_out = hi_bnd_in - hi_bnd_stencil + ng
+
+    if ( any(lo_bnd_out > hi_bnd_out) ) then
+      lo_bnd_out = 1
+      hi_bnd_out = 0
+    end if
+  end subroutine determine_interior_stencil_count
+
+  subroutine sort_stencil_idx( n_stencil, stencil )
+    use quick_sort, only : sort
+    integer,                         intent(in)    :: n_stencil
+    integer, dimension(3,n_stencil), intent(inout) :: stencil
+    integer, dimension(3,n_stencil) :: stencil_tmp
+    integer, dimension(3) :: min_bnd, max_bnd, range
+    integer, dimension(n_stencil)   :: ind1, ind2
+    integer :: i
+    min_bnd = minval(stencil,dim=2)
+    max_bnd = maxval(stencil,dim=2)
+    range   = max_bnd - min_bnd + 1
+    do i = 1,n_stencil
+      ind1(i) = ( stencil(1,i) - min_bnd(1) )                              &
+              + ( stencil(2,i) - min_bnd(2) ) * range(1)                   &
+              + ( stencil(3,i) - min_bnd(3) ) * range(1) * range(2)
+      ind2(i) = i
+    end do
+    ! call qsort( n_stencil, ind1, ind2 )
+    call sort(ind1,idx=ind2)
+    stencil_tmp = stencil
+    do i = 1,n_stencil
+      stencil(:,i) = stencil_tmp(:,ind2(i))
+    end do
+  end subroutine sort_stencil_idx
+
+  subroutine inviscid_stencil_indices_3D(len,idx)
+    integer, intent(in) :: len
+    integer, dimension(3,(2*len)*3+1), intent(out) :: idx
+    integer, dimension(3) :: idx_tmp
+    integer :: dim, off, cnt
+    idx = 0
+    cnt = 1
+    do dim = 1,3
+      do off = -len,-1
+        cnt = cnt + 1
+        idx_tmp = 0
+        idx_tmp(dim) = idx_tmp(dim) + off
+        idx(:,cnt) = idx_tmp
+      end do
+      do off = 1,len
+        cnt = cnt + 1
+        idx_tmp = 0
+        idx_tmp(dim) = idx_tmp(dim) + off
+        idx(:,cnt) = idx_tmp
+      end do
+    end do
+  end subroutine inviscid_stencil_indices_3D
+
+  subroutine viscous_offsets(direction,ndim,offsets)
+    use index_conversion, only : shift_val_to_start
+    integer,                         intent(in)  :: direction, ndim
+    integer, dimension(:,:), allocatable, intent(out) :: offsets
+    integer, dimension(ndim) :: d
+    integer :: s, dir
+    integer :: i, j, k, cnt
+    allocate( offsets(ndim,2+2**ndim) )
+    offsets = 0
+    dir = abs(direction)
+    s   = sign(1,direction)
+    do i = 1,ndim
+      d(i) = i
+    end do
+    call shift_val_to_start(d,dir)
+    cnt = 0
+    do i = 1,2
+      cnt = cnt + 1
+      offsets(dir,cnt) = s*mod(cnt+1,2)
+    end do
+    do i = 2,ndim
+      do j = -1,1,2
+        do k = 1,2
+          cnt = cnt + 1
+          offsets(dir,cnt) = s*mod(cnt+1,2)
+          offsets(d(i),cnt) = j
+        end do
+      end do
+    end do
+  end subroutine viscous_offsets
+
+  subroutine muscl_offsets(direction,ndim,offsets)
+    integer,                 intent(in)  :: direction, ndim
+    integer, dimension(:,:), allocatable, intent(out) :: offsets
+    integer :: i, dir, s
+
+    allocate( offsets(ndim,4) )
+    offsets = 0
+    dir = abs(direction)
+    s   = sign(1,direction)
+
+    do i = 1,4
+      offsets(dir,i) = i-2+(s-1)/2
+    end do
+  end subroutine muscl_offsets
+
+  subroutine center_offsets(direction,ndim,offsets)
+    integer,                 intent(in)  :: direction, ndim
+    integer, dimension(:,:), allocatable, intent(out) :: offsets
+    integer :: s, dir
+    integer, dimension(ndim) :: start
+    integer :: i, j, cnt
+
+    allocate( offsets(ndim,1+2*ndim) )
+    offsets = 0
+    start = 0
+    dir = abs(direction)
+    s   = sign(1,direction)
+    if (dir /= 0) then
+      start(dir) = s
+    end if
+
+    cnt = 1
+    offsets(:,cnt) = start
+    do i = 1,ndim
+      do j = -1,1,2
+          cnt = cnt + 1
+          offsets(:,cnt) = start
+          offsets(i,cnt) = offsets(i,cnt) + j
+      end do
+    end do
+  end subroutine center_offsets
+
+  subroutine linear_map_offsets_check(offsets,max_bnd,min_bnd,idx,n_valid)
+    use index_conversion, only : in_bound
+    integer, dimension(:,:), intent(in) :: offsets
+    integer, dimension(3),   intent(in) :: max_bnd, min_bnd
+    integer, dimension(size(offsets,2)), intent(out) :: idx
+    integer,                             intent(out) :: n_valid
+    integer, dimension(3) :: range
+    logical, dimension(size(offsets,2)) :: mask
+
+    integer :: i, Ncells
+
+    Ncells = size(offsets,2)
+
+    range   = max_bnd - min_bnd + 1
+
+    !! out of bounds check
+    do i = 1,Ncells
+      mask(i) = in_bound(3,offsets(:,i),min_bnd,max_bnd)
+    end do
+    n_valid = count(mask)
+    do i = 1,Ncells
+      idx(i) = ( offsets(1,i) - min_bnd(1) )                                   &
+             + ( offsets(2,i) - min_bnd(2) ) * range(1)                        &
+             + ( offsets(3,i) - min_bnd(3) ) * range(1) * range(2)
+    end do
+
+    idx(1:n_valid) = pack(idx,mask)
+
+  end subroutine linear_map_offsets_check
+
+end module stencil_indexing
+
+module stencil_cell_derived_type
+
+  use set_precision, only : dp
+
+  implicit none
+
+  private
+  public :: stencil_cell_t, block_info
+  public :: check_neighbors
+
+  type basic_bc_info
+    integer :: block_id = -1
+    integer :: face_id  = -1
+    integer, dimension(3) :: bnd_min = -1
+    integer, dimension(3) :: bnd_max = -1
+  end type basic_bc_info
+
+  type connected_bc_info
+    type(basic_bc_info) :: self, nbor
+  end type connected_bc_info
+
+  type block_info
+    integer               :: block_id = -1
+    integer, dimension(3) :: Ncells   = -1
+    type(connected_bc_info), allocatable, dimension(:) :: connected_bc_list
+  contains
+    ! procedure, public, pass :: create  => create_block_info
+    procedure, public, pass :: destroy => destroy_block_info
+  end type block_info
+
+  type stencil_cell_t
+    type(block_info)        :: info
+    integer, dimension(4)   :: idx      = 0
+    integer, dimension(4,6) :: nbor_idx = 0
+    logical, dimension(6)   :: free     = .false.
+    integer                 :: degree   = 0
+  contains
+    procedure, public, pass :: create  => create_stencil_cell
+    procedure, public, pass :: destroy => destroy_stencil_cell
+  end type stencil_cell_t
+
+  interface block_info
+    module procedure block_info_constructor
+  end interface block_info
+
+contains
+
+  function block_info_constructor( block_id, Ncells, connected_bc_list ) result(this)
+    integer, intent(in) :: block_id
+    integer, dimension(3), intent(in) :: Ncells
+    type(connected_bc_info), dimension(:), optional, intent(in) :: connected_bc_list
+    type(block_info) :: this
+    call this%destroy()
+    this%block_id = block_id
+    this%Ncells   = Ncells
+
+    if ( present( connected_bc_list ) ) then
+      allocate( this%connected_bc_list(size(connected_bc_list)) )
+      this%connected_bc_list = connected_bc_list
+    else
+      allocate( this%connected_bc_list(0) )
+    end if
+    
+  end function block_info_constructor
+
+  ! subroutine create_block_info( this, gblock )
+  !   use grid_derived_type, only : grid_block
+  !   class(block_info), intent(inout) :: this
+  !   type(grid_block),  intent(in)    :: gblock
+  !   integer :: n, cnt, n_connected
+
+  !   this%block_id = gblock%block_id
+  !   this%Ncells   = gblock%Ncells
+
+  !   n_connected = 0
+  !   do n = 1,gblock%nbounds
+  !     if ( gblock%boundaries(n)%bc%is_connected ) n_connected = n_connected+1
+  !   end do
+  !   allocate( this%connected_bc_list(n_connected) )
+
+  !   cnt = 0
+  !   do n = 1,gblock%nbounds
+  !     if ( gblock%boundaries(n)%bc%is_connected ) then
+  !       cnt = cnt + 1
+  !       this%connected_bc_list(cnt)%self%block_id = gblock%boundaries(n)%bc%block_id
+  !       this%connected_bc_list(cnt)%self%face_id  = gblock%boundaries(n)%bc%face_label
+  !       ! this%connected_bc_list(cnt)%self%bnd_min  = gblock%boundaries(n)%bc%idx_min
+  !       ! this%connected_bc_list(cnt)%self%bnd_max  = gblock%boundaries(n)%bc%idx_max
+  !       this%connected_bc_list(cnt)%self%bnd_min  = gblock%boundaries(n)%bc%node_idx_min
+  !       this%connected_bc_list(cnt)%self%bnd_max  = gblock%boundaries(n)%bc%node_idx_max
+
+  !       call node_to_cell_idx( this%connected_bc_list(cnt)%self%bnd_min,       &
+  !                              this%connected_bc_list(cnt)%self%bnd_max )
+
+  !       this%connected_bc_list(cnt)%nbor%block_id = gblock%boundaries(n)%bc%nbor%block_id
+  !       this%connected_bc_list(cnt)%nbor%face_id  = gblock%boundaries(n)%bc%nbor%face_label
+  !       ! this%connected_bc_list(cnt)%nbor%bnd_min  = gblock%boundaries(n)%bc%nbor%idx_min
+  !       ! this%connected_bc_list(cnt)%nbor%bnd_max  = gblock%boundaries(n)%bc%nbor%idx_max
+  !       this%connected_bc_list(cnt)%nbor%bnd_min  = gblock%boundaries(n)%bc%nbor%node_idx_min
+  !       this%connected_bc_list(cnt)%nbor%bnd_max  = gblock%boundaries(n)%bc%nbor%node_idx_max
+
+  !       call node_to_cell_idx( this%connected_bc_list(cnt)%nbor%bnd_min,       &
+  !                              this%connected_bc_list(cnt)%nbor%bnd_max )
+  !     end if
+  !   end do
+
+  ! end subroutine create_block_info
+
+  subroutine destroy_block_info( this )
+    class(block_info), intent(inout) :: this
+    if ( allocated(this%connected_bc_list) ) deallocate(this%connected_bc_list)
+  end subroutine destroy_block_info
+
+  subroutine destroy_stencil_cell( this )
+    class(stencil_cell_t), intent(inout) :: this
+    call this%info%destroy()
+  end subroutine destroy_stencil_cell
+
+  subroutine create_stencil_cell( this, block_id, idx, block_info_list )
+    use index_conversion, only : in_bound, get_neighbor_idx
+    use stencil_indexing, only : cell_offsets, on_3d_boundary
+    class(stencil_cell_t),          intent(inout) :: this
+    integer,                        intent(in)    :: block_id
+    integer,          dimension(3), intent(in)    :: idx
+    type(block_info), dimension(:), intent(in)    :: block_info_list
+
+    logical, dimension(6)   :: mask
+    integer, dimension(3) :: bnd_min, bnd_max
+    integer, dimension(3,2) :: bnds
+
+    integer :: i, j, k
+
+    call this%destroy()
+
+    this%idx(1)   = block_id
+    this%idx(2:4) = idx
+    ! get block info
+    do i = 1,size(block_info_list)
+      if ( block_info_list(i)%block_id == this%idx(1) ) then
+        this%info = block_info_list(i)
+        exit
+      end if
+    end do
+    ! check if the current cell is on any of the block boundaries
+    bnd_min = [1,1,1]
+    bnd_max = this%info%Ncells
+    bnds(:,1) = bnd_min
+    bnds(:,2) = bnd_max
+    mask = on_3d_boundary( this%idx(2:4), bnds )
+    do i = 1,6
+      if ( mask(i) ) then
+        ! assume out-of-bounds for now
+        this%free(i) = .false.
+        ! find corresponding connected boundary if it exists
+        do j = 1,size( this%info%connected_bc_list )
+          ! try this BC ...
+          if ( this%info%connected_bc_list(j)%self%face_id == i ) then
+    associate( bnd_min1 => this%info%connected_bc_list(j)%self%bnd_min,        &
+               bnd_max1 => this%info%connected_bc_list(j)%self%bnd_max )
+            ! ... if the bounds match
+            if ( in_bound( 3, this%idx(2:4), bnd_min1, bnd_max1 ) ) then
+              ! get the neighbor
+      associate( bnd_min2 => this%info%connected_bc_list(j)%nbor%bnd_min,      &
+                 bnd_max2 => this%info%connected_bc_list(j)%nbor%bnd_max )
+              this%nbor_idx(1,i) = this%info%connected_bc_list(j)%nbor%block_id
+              call get_neighbor_idx( 3, bnd_min1, bnd_max1,                    &
+                                        bnd_min2, bnd_max2,                    &
+                                        this%idx(2:4), this%nbor_idx(2:4,i) )
+              ! check if the neighbor is in bounds
+              do k = 1,size( block_info_list )
+                ! find the corresponding neighboring block dimensions
+                if (                  block_info_list(k)%block_id ==           &
+                     this%info%connected_bc_list(j)%nbor%block_id    ) then
+                  this%free(i) = in_bound( 3, this%nbor_idx(2:4,i), bnd_min,   &
+                                              block_info_list(k)%Ncells )
+                  exit
+                end if
+              end do
+      end associate
+            end if
+    end associate  
+          end if
+        end do
+      else
+        ! same block, simple offset
+        this%nbor_idx(:,i) = this%idx
+        this%nbor_idx(2:4,i) = this%nbor_idx(2:4,i) + cell_offsets(:,i)
+        this%free(i) = in_bound( 3, this%nbor_idx(2:4,i), bnd_min, bnd_max )
+      end if
+    end do
+
+  end subroutine create_stencil_cell
+
+  subroutine check_neighbors( stencil, stencil_idx, n_cells )
+    type(stencil_cell_t), dimension(:), intent(inout) :: stencil
+    integer,                            intent(in)    :: stencil_idx, n_cells
+    integer, dimension(4) :: idx_tmp
+    integer :: i, j, k
+
+    do j = 1,n_cells
+      if ( j==stencil_idx ) cycle
+      do i = 1,6
+        if ( stencil(stencil_idx)%free(i) ) then
+          idx_tmp = stencil(stencil_idx)%nbor_idx(:,i)
+          if ( all( stencil(j)%idx == idx_tmp ) ) then
+            ! update the mask on the current cell
+            stencil(stencil_idx)%free(i) = .false.
+            stencil(stencil_idx)%degree = min( stencil(stencil_idx)%degree,    &
+                                               stencil(j)%degree + 1 )
+            ! and on the jth cell
+            do k = 1,6
+              if ( all( stencil(j)%nbor_idx(:,k) ==                            &
+                        stencil(stencil_idx)%idx ) ) then
+                stencil(j)%free(k) = .false.
+                exit
+              end if
+            end do
+          end if
+        end if
+      end do
+    end do
+  end subroutine check_neighbors
+
+end module stencil_cell_derived_type
+
+module stencil_growing_routines
+
+  use set_precision, only : dp
+  use set_constants, only : zero, large
+
+  implicit none
+
+  private
+
+  public :: grow_stencil_basic
+
+  character(*), parameter :: FMT = '("iter: ",I4," start: (",3(I3),"), '//     &
+                                   'shift: (",3(I3),"), end: (",3(I3),")")'
+  character(*), parameter :: msg_FMT = '("Warning: Could not fill stencil'//   &
+                                       ' to requested size, n =",I4)'
+
+  contains
+
+  subroutine grow_stencil_basic( block_id, idx, N_cells, sz, idx_list )
+    use stencil_cell_derived_type, only : block_info
+    integer,                              intent(in)  :: block_id
+    integer, dimension(3),                intent(in)  :: idx, N_cells
+    integer,                              intent(in)  :: sz
+    integer, dimension(:,:), allocatable, intent(out) :: idx_list
+
+    call grow_stencil_new_connected_block( block_id, idx, [block_info(block_id,N_cells)], sz, idx_list )
+  end subroutine grow_stencil_basic
+
+  subroutine grow_stencil_new_connected_block( block_id, idx, block_info_list, sz, idx_list )
+    use stencil_indexing, only : sort_stencil_idx
+    use stencil_cell_derived_type, only : block_info, stencil_cell_t
+    integer,                              intent(in)  :: block_id
+    integer, dimension(3),                intent(in)  :: idx
+    type(block_info), dimension(:),       intent(in)  :: block_info_list
+    integer,                              intent(in)  :: sz
+    integer, dimension(:,:), allocatable, intent(out) :: idx_list
+    type(stencil_cell_t), dimension(3*sz) :: stencil
+    integer :: n1
+    integer :: i
+    logical :: balanced
+    integer, dimension(4) :: idx_tmp
+    balanced = .true.
+    
+    call build_stencil_connected_block( block_id, idx, sz, block_info_list, &
+                                        n1, stencil, balanced=.true. )
+
+    allocate( idx_list(n1,4) )
+
+
+    idx_tmp(1) = block_id
+    idx_tmp(2:4) = idx
+
+    do i = 1,n1
+      idx_list(i,:) = stencil(i)%idx
+    end do
+
+    ! call sort_stencil_idx(n1,idx_list)
+
+  end subroutine grow_stencil_new_connected_block
+
+  subroutine build_stencil_connected_block( block_id, idx, n_stencil,          &
+                                            block_info_list, n_out, stencil, balanced )
+    use message,         only : warning_message
+    use project_inputs,  only : verbose_level
+    use stencil_indexing, only : cell_offsets, get_linear_face_idx
+    use stencil_cell_derived_type, only : stencil_cell_t, block_info, check_neighbors
+
+    integer,                                      intent(in)  :: block_id
+    integer,              dimension(3),           intent(in)  :: idx
+    integer,                                      intent(in)  :: n_stencil
+    type(block_info),     dimension(:),           intent(in)  :: block_info_list
+    integer,                                      intent(out) :: n_out
+    type(stencil_cell_t), dimension(3*n_stencil), intent(out) :: stencil
+    logical,              optional,               intent(in)  :: balanced
+    integer :: n, i, cnt, in_it, out_it, min_degree, current_min_degree
+    integer :: stencil_idx, face_idx, out_it_max, in_it_max
+    integer, dimension(4) :: idx1
+    character(*), parameter :: name = 'build_stencil_connected_block'
+    character(200) :: msg
+    logical :: ierr, flag
+
+    if ( balanced ) then
+      out_it_max  = 6*n_stencil
+      in_it_max   = 6*n_stencil
+    else
+      out_it_max  = n_stencil
+      in_it_max   = 1
+    end if
+
+    ! parent cell
+    n         = 1
+    idx1(1)   = block_id
+    idx1(2:4) = idx
+    call stencil(n)%create( block_id, idx, block_info_list )
+
+    flag = .false.
+    out_it = 0
+    do while ( ( n < n_stencil ).and.( out_it < out_it_max ) )
+      out_it = out_it + 1
+      ! update masks and degree
+      do i = 1,n
+        call check_neighbors( stencil, i, n )
+      end do
+      ! iterate through cells and calculate minimum degree
+      call get_distance( stencil, n, stencil_idx, face_idx, min_degree )
+
+      cnt = 0
+      in_it = 0
+      current_min_degree = min_degree
+      do while ( ( min_degree == current_min_degree ).and.(in_it < in_it_max) )
+
+        in_it = in_it + 1
+
+        if (stencil_idx == -1) then
+          write(msg,msg_FMT) n
+          n_out = n
+          ierr = warning_message(verbose_level,name,msg)
+          exit
+        end if
+        if ( .not.any(stencil(stencil_idx)%free) ) then
+          exit
+        end if
+
+        idx1 = stencil(stencil_idx)%nbor_idx(:,face_idx)
+
+        ! increment the counter
+        cnt = cnt + 1
+
+        ! add the new cell
+        call stencil(n+cnt)%create( idx1(1), idx1(2:4), block_info_list )
+
+        ! set the degree
+        stencil(n+cnt)%degree = min_degree + 1
+
+        ! check for any edge cases
+        do i = 1,n+cnt
+          call check_neighbors( stencil, i, n+cnt )
+        end do
+        ! iterate through cells and calculate new degrees
+        call get_distance( stencil, n, stencil_idx, face_idx, min_degree )
+      end do
+      ! increment the counter
+      n = n + cnt
+      if ( flag ) exit
+    end do
+    n_out = n
+  end subroutine build_stencil_connected_block
+
+  subroutine get_distance( stencil, n_cells, stencil_idx, face_idx, min_degree )
+    use stencil_cell_derived_type, only : stencil_cell_t
+    use stencil_indexing, only : mask_in_bounds, get_offsets, get_linear_face_idx
+    type(stencil_cell_t), dimension(:), intent(inout) :: stencil
+    integer,                            intent(in)    :: n_cells
+    integer,                            intent(out)   :: stencil_idx, face_idx, min_degree
+    
+    integer,  dimension(6*n_cells) :: degree
+    integer,  dimension(6*n_cells) :: stencil_indices
+    integer,  dimension(6*n_cells) :: mask_indices
+    logical,  dimension(6*n_cells) :: min_mask
+    integer,  dimension(3)   :: idx
+    integer,  dimension(1)   :: min_idx, degree_tmp
+    integer :: i, j, n, cnt, block_id
+
+    stencil_idx = -1
+    face_idx    = -1
+    min_degree  = 6*n_cells
+    degree(:)          = 1
+    stencil_indices(:) = 1
+
+    cnt = 0
+    ! iterate through cells and calculate distances
+    do j = 1,n_cells
+      if ( .not. any( stencil(j)%free ) ) cycle
+      ! for each neighbor
+      do i = 1,6
+        if ( stencil(j)%free(i) ) then
+          cnt = cnt + 1
+          degree(cnt) = stencil(j)%degree
+          min_degree  = minval( degree(1:cnt) )
+          block_id    = stencil(j)%nbor_idx(1,i)
+          idx         = stencil(j)%nbor_idx(2:4,i)
+          stencil_indices(cnt) = j
+          mask_indices(cnt)    = i
+        end if
+      end do
+    end do
+
+    if (cnt > 0) then
+      ! find the 1st minimum index
+      min_idx = minloc( degree(1:cnt) )
+        
+      ! Now grab any other indices that match this distance
+      degree_tmp = degree( min_idx(1) )
+      min_mask = ( degree == degree_tmp(1) )
+      
+      n = count(min_mask)
+      stencil_indices(1:n) = pack(stencil_indices,min_mask)
+      mask_indices(1:n)    = pack(mask_indices,   min_mask)
+
+      face_idx    = mask_indices( min_idx(1) )
+      stencil_idx = stencil_indices( min_idx(1) )
+      min_degree  = degree( min_idx(1) )
+    end if
+
+  end subroutine get_distance
+
+end module stencil_growing_routines
 
 module combinatorics
   implicit none
@@ -3438,12 +4350,374 @@ module k_exact_cell_derived_type
 
   implicit none
   private
-  ! public :: k_exact_cell_t
-  ! type(zero_mean_basis_t)                 :: basis
-  !   real(dp), dimension(:,:),   allocatable :: coefs
-  !   real(dp), dimension(:,:),   allocatable :: Ainv
+  public :: k_exact_cell_t
+
+  type :: k_exact_cell_t
+    type(zero_mean_basis_t)                 :: basis
+    real(dp), dimension(:,:),   allocatable :: coefs
+    real(dp), dimension(:,:),   allocatable :: Ainv
+    integer :: n_vars
+    integer :: self_idx
+    integer :: self_block
+    integer :: n_nbor
+    integer, dimension(:), allocatable :: nbor_block, nbor_idx
+  contains
+    private
+    procedure, public, pass :: destroy => destroy_k_exact_cell_t
+    procedure, public, pass :: eval => evaluate_reconstruction
+  end type k_exact_cell_t
+
+  interface k_exact_cell_t
+    module procedure constructor
+  end interface k_exact_cell_t
+
 contains
+
+  pure elemental subroutine destroy_k_exact_cell_t(this)
+    class(k_exact_cell_t), intent(inout) :: this
+    call this%basis%destroy()
+    if ( allocated(this%nbor_block) ) deallocate( this%nbor_block )
+    if ( allocated(this%nbor_idx  ) ) deallocate( this%nbor_idx   )
+    if ( allocated(this%coefs     ) ) deallocate( this%coefs      )
+    if ( allocated(this%Ainv      ) ) deallocate( this%Ainv       )
+    this%self_idx   = 0
+    this%self_block = 0
+    this%n_vars     = 0
+  end subroutine destroy_k_exact_cell_t
+
+  function constructor( p, self_block, self_idx, n_nbor, nbor_block, nbor_idx, n_vars, quad, h_ref ) result(this)
+    ! function constructor( p, self_block, self_idx,                               &
+    !                     nbor_block, nbor_idx, face_id, n_interior,             &
+    !                     n_vars, quad, h_ref ) result(this)
+    use set_constants, only : zero
+    type(monomial_basis_t),        intent(in) :: p
+    integer,                       intent(in) :: self_block, self_idx, n_nbor
+    integer, dimension(:),         intent(in) :: nbor_block, nbor_idx
+    integer,                       intent(in) :: n_vars
+    type(quad_t),                  intent(in) :: quad
+    real(dp), dimension(p%n_dim),  intent(in) :: h_ref
+    type(k_exact_cell_t)                      :: this
+    call this%destroy()
+    this%basis = zero_mean_basis_t( p, quad, h_ref )
+    this%n_nbor = n_nbor
+    allocate( this%nbor_block( n_nbor ) ); this%nbor_block = nbor_block(1:n_nbor)
+    allocate( this%nbor_idx(   n_nbor ) ); this%nbor_idx   = nbor_idx(1:n_nbor)
+    allocate( this%coefs( p%n_terms, n_vars ) )
+    allocate( this%Ainv(  p%n_terms-1, n_nbor+1 ) )
+  end function constructor
+
+  pure function evaluate_reconstruction( this, p, point, n_terms,              &
+                                         n_var, var_idx ) result(val)
+    use set_constants, only : zero
+    class(k_exact_cell_t),      intent(in) :: this
+    type(monomial_basis_t),     intent(in) :: p
+    real(dp), dimension(:),     intent(in) :: point
+    integer,                    intent(in) :: n_terms, n_var
+    integer,  dimension(n_var), intent(in) :: var_idx
+    real(dp), dimension(n_var)             :: val
+    real(dp), dimension(n_terms) :: basis
+    integer :: v, n
+    val = zero
+    do n = 1,n_terms
+      basis(n) = this%basis%eval(p,n,point)
+    end do
+    do v = 1,n_var
+      val(v) = val(v) + dot_product( this%coefs(1:n_terms,var_idx(v)), basis )
+    end do
+  end function evaluate_reconstruction
+
 end module k_exact_cell_derived_type
+
+module k_exact_block_derived_type
+  use set_precision,               only : dp
+  use monomial_basis_derived_type, only : monomial_basis_t
+  use k_exact_cell_derived_type,   only : k_exact_cell_t
+  implicit none
+  private
+  public :: k_exact_block_t
+  type :: k_exact_block_t
+    private
+    integer, public :: block_num, n_dim, degree, n_vars, n_cells_total
+    integer, public,      dimension(:), allocatable :: n_cells
+    type(k_exact_cell_t), dimension(:), allocatable :: cells
+    type(monomial_basis_t), public :: p
+  contains
+    private
+    procedure, public, pass :: destroy => destroy_k_exact_block_t
+    ! procedure, public, pass :: solve   => perform_iterative_reconstruction_SOR
+    procedure, public, pass :: eval    => evaluate_block_rec_cell
+    procedure, public, pass :: set_cell_avgs, init_cells
+  end type k_exact_block_t
+
+  interface k_exact_block_t
+    module procedure constructor
+  end interface k_exact_block_t
+
+contains
+
+  pure elemental subroutine destroy_k_exact_block_t( this )
+    class(k_exact_block_t), intent(inout) :: this
+    if ( allocated(this%n_cells) ) deallocate( this%n_cells )
+    if ( allocated(this%cells) ) then
+      call this%cells%destroy()
+      deallocate( this%cells )
+    end if
+    this%block_num     = 0
+    this%n_dim         = 0
+    this%degree        = 0
+    this%n_vars        = 0
+    this%n_cells_total = 0
+  end subroutine destroy_k_exact_block_t
+
+  function constructor( grid, block_num, n_dim, degree, n_var ) result(this)
+    
+    use math,              only : maximal_extents
+    use index_conversion,  only : cell_face_nbors, global2local_bnd, local2global_bnd
+    use grid_derived_type, only : grid_type, pack_cell_node_coords
+    use stencil_growing_routines, only : grow_stencil_basic
+    implicit none
+    type(grid_type),   intent(in) :: grid
+    integer,           intent(in) :: block_num, n_dim, degree, n_var
+    type(k_exact_block_t)         :: this
+    integer,  dimension(3)     :: idx_tmp, lo, hi1, hi2, n_skip
+    real(dp), dimension(:,:), allocatable   :: nodes
+    real(dp), dimension(n_dim) :: h_ref
+    integer,  dimension(2*n_dim) :: nbor_block, nbor_cell_idx, nbor_face_id
+    integer :: n, i, n_interior, n_cell_nodes, n_nbors, sz
+    integer, dimension(:,:), allocatable :: idx_list
+    integer, dimension(:), allocatable :: idx_list_lin
+    call this%destroy()
+    allocate( this%n_cells( n_dim ) )
+    this%n_cells        = grid%gblock(block_num)%n_cells(1:n_dim)
+    this%n_cells_total  = product(this%n_cells)
+    this%block_num      = block_num
+    this%n_dim          = n_dim
+    this%degree         = degree
+    this%n_vars         = n_var
+    this%p = monomial_basis_t( this%degree, this%n_dim )
+    allocate( this%cells(this%n_cells_total) )
+
+    n_skip = 0; n_skip(1:n_dim) = 1
+    n_cell_nodes = product(n_skip+1)
+
+    allocate( nodes(3,n_cell_nodes) )
+
+    lo = [1,1,1]
+    hi1 = grid%gblock(block_num)%n_cells
+    hi2 = grid%gblock(block_num)%n_nodes
+
+    sz = (3 * this%p%n_terms)/2
+
+    idx_tmp = 1
+    do n = 1,this%n_cells_total
+      idx_tmp(1:n_dim) = global2local_bnd( n, lo(1:n_dim), hi1(1:n_dim) )
+
+      call grow_stencil_basic( block_num, idx_tmp, hi1, sz, idx_list )
+      n_nbors = size(idx_list,1)
+      allocate( idx_list_lin( n_nbors ) )
+      ! stencil%idx(1)   = block_id
+      ! stencil%idx(2:4) = idx
+      ! idx_list(i,:) = stencil(i)%idx
+
+      do i = 1, n_nbors
+        idx_list_lin(i) = local2global_bnd( idx_list(i,2:4),lo,hi1)
+      end do
+      nbor_block = block_num
+      nodes = pack_cell_node_coords( idx_tmp, lo, hi2, n_skip,                 &
+                                     grid%gblock(block_num)%node_coords )
+      h_ref = maximal_extents( n_dim, n_cell_nodes, nodes(1:n_dim,:) )
+      associate( quad => grid%gblock(block_num)%grid_vars%quad( idx_tmp(1),    &
+                                                                idx_tmp(2),    &
+                                                                idx_tmp(3) ) )
+        this%cells(n) = k_exact_cell_t( this%p,                                &
+                                        block_num,                             &
+                                        n,                                     &
+                                        n_nbors,                               &
+                                        idx_list(:,1),                         &
+                                        idx_list_lin,                          &
+                                        n_var,                                 &
+                                        quad,                                  &
+                                        h_ref )
+      end associate
+      if ( allocated(idx_list) ) deallocate( idx_list )
+      if ( allocated(idx_list_lin) ) deallocate( idx_list_lin )
+    end do
+    deallocate( nodes )
+    if ( allocated(idx_list) ) deallocate( idx_list )
+    if ( allocated(idx_list_lin) ) deallocate( idx_list_lin )
+  end function constructor
+
+  pure function evaluate_block_rec_cell( this, cell_idx, x, vars, n_terms )    &
+                                                                    result(val)
+    use index_conversion, only : local2global
+    class(k_exact_block_t), intent(in) :: this
+    integer, dimension(:),  intent(in) :: cell_idx
+    real(dp), dimension(:), intent(in) :: x
+    integer, dimension(:),  intent(in) :: vars
+    integer, optional,      intent(in) :: n_terms
+    real(dp), dimension(size(vars))    :: val
+    integer :: n_terms_, n_vars, lin_idx
+
+    n_vars = size(vars)
+    n_terms_ = this%p%n_terms
+    if ( present(n_terms) ) n_terms_ = max(min(n_terms_,n_terms),1)
+
+    lin_idx = local2global( cell_idx(1:this%n_dim), this%n_cells )
+
+    val = this%cells(lin_idx)%eval( this%p, x, n_terms_, n_vars, vars )
+  end function evaluate_block_rec_cell
+
+  pure function get_cell_avg(quad,n_dim,n_var,var_idx,eval_fun) result(avg)
+    use set_constants, only : zero
+    use quadrature_derived_type, only : quad_t
+    use function_holder_type,    only : func_h_t
+    type(quad_t),           intent(in) :: quad
+    integer,                intent(in) :: n_dim, n_var
+    integer,  dimension(:), intent(in) :: var_idx
+    class(func_h_t),        intent(in) :: eval_fun
+    real(dp), dimension(n_var)         :: avg
+    real(dp), dimension(n_var,quad%n_quad) :: tmp_val
+    integer :: n
+    tmp_val = zero
+    do n = 1,quad%n_quad
+      tmp_val(:,n) = eval_fun%test_eval( n_dim, n_var, quad%quad_pts(:,n) )
+    end do
+    avg = quad%integrate( n_var, tmp_val ) / sum( quad%quad_wts)
+  end function get_cell_avg
+
+  pure subroutine set_cell_avgs(this,gblock,n_var,var_idx,eval_fun)
+    use grid_derived_type,       only : grid_block
+    use index_conversion,        only : global2local
+    use function_holder_type,    only : func_h_t
+    class(k_exact_block_t), intent(inout) :: this
+    type(grid_block),       intent(in)    :: gblock
+    integer,                intent(in)    :: n_var
+    integer,  dimension(:), intent(in)    :: var_idx
+    class(func_h_t),        intent(in)    :: eval_fun
+    real(dp), dimension(n_var) :: tmp_val
+    integer,  dimension(3)     :: tmp_idx
+    integer :: i, v
+    tmp_idx = 1
+    do i = 1, this%n_cells_total
+      tmp_idx(1:this%n_dim) = global2local(i,this%n_cells)
+      tmp_val = get_cell_avg( gblock%grid_vars%quad( tmp_idx(1),               &
+                                                     tmp_idx(2),               &
+                                                     tmp_idx(3) ),             &
+                              this%p%n_dim, n_var, var_idx, eval_fun )
+      do v = 1,n_var
+        this%cells(i)%coefs(1,var_idx(v)) = tmp_val(v)
+      end do
+    end do
+  end subroutine set_cell_avgs
+
+  subroutine init_cells(this,grid,term_start,term_end,n_var,var_idx)
+    use grid_derived_type, only : grid_type 
+    use string_stuff,      only : progress_line
+    class(k_exact_block_t), intent(inout) :: this
+    type(grid_type),        intent(in)    :: grid
+    integer,                intent(in)    :: term_start, term_end, n_var
+    integer, dimension(:),  intent(in)    :: var_idx
+    integer :: n
+    do n = 1,this%n_cells_total
+      call progress_line('initializing cell ',n,this%n_cells_total)
+      ! call this%get_cell_LHS( grid, n, term_start, term_end )
+      ! this%cells(n)%RHS = this%get_cell_RHS( n, term_start, term_end,          &
+      !                                        n_var, var_idx )
+    end do
+    write(*,*)
+  end subroutine init_cells
+
+end module k_exact_block_derived_type
+
+module k_exact_derived_type
+  use set_precision,              only : dp
+  use k_exact_block_derived_type, only : k_exact_block_t
+  use function_holder_type,       only : func_h_t
+  implicit none
+  private
+  public :: k_exact_t
+
+  type :: k_exact_t
+    private
+    integer, public :: n_blocks, n_dim, n_vars, degree
+    type(k_exact_block_t), dimension(:), allocatable, public :: b
+  contains
+    private
+    procedure, public, pass :: destroy => destroy_k_exact_t
+    ! procedure, public, pass :: solve   => iterative_solve
+    procedure, public, pass :: eval    => evaluate_reconstruction
+  end type k_exact_t
+
+  interface k_exact_t
+    module procedure constructor
+  end interface k_exact_t
+contains
+  pure elemental subroutine destroy_k_exact_t( this )
+    class(k_exact_t), intent(inout) :: this
+    if ( allocated(this%b) ) then
+      call this%b%destroy()
+      deallocate( this%b )
+    end if
+    this%n_blocks = 0
+    this%n_dim    = 0
+    this%n_vars   = 0
+    this%degree   = 0
+  end subroutine destroy_k_exact_t
+
+  function constructor( grid, n_dim, degree, n_vars, ext_fun ) result(this)
+    use grid_derived_type, only : grid_type
+    use function_holder_type,       only : func_h_t
+    type(grid_type),                 intent(in) :: grid
+    integer,                         intent(in) :: n_dim, degree, n_vars
+    ! integer, dimension(:), optional, intent(in) :: n_skip
+    class(func_h_t), optional,       intent(in) :: ext_fun
+    type(k_exact_t) :: this
+    ! integer, dimension(n_dim) :: n_skip_
+    integer :: i, n
+    call this%destroy()
+
+    ! n_skip_ = 1
+    ! if ( present(n_skip) ) n_skip_ = n_skip
+
+    this%n_dim    = n_dim
+    this%n_vars   = n_vars
+    this%degree   = degree
+    this%n_blocks = grid%n_blocks
+
+    allocate( this%b(this%n_blocks) )
+    do i = 1,this%n_blocks
+      this%b(i) = k_exact_block_t( grid, i, n_dim, degree, n_vars )
+    end do
+
+    if ( present(ext_fun) ) then
+      do i = 1,this%n_blocks
+        call this%b(i)%set_cell_avgs( grid%gblock(i), n_vars, [(n,n=1,n_vars)],&
+                                      ext_fun )
+      end do
+    end if
+  end function constructor
+
+  pure function evaluate_reconstruction( this, blk, cell_idx,                  &
+                                         x, vars, n_terms ) result(val)
+    use index_conversion, only : local2global
+    class(k_exact_t), intent(in) :: this
+    integer,                intent(in) :: blk
+    integer, dimension(:),  intent(in) :: cell_idx
+    real(dp), dimension(:), intent(in) :: x
+    integer, dimension(:),  intent(in) :: vars
+    integer, optional,      intent(in) :: n_terms
+    real(dp), dimension(size(vars))    :: val
+    integer :: n_vars
+
+    n_vars = size(vars)
+    if ( present(n_terms) ) then
+      val = this%b(blk)%eval(cell_idx, x, vars, n_terms=n_terms )
+    else
+      val = this%b(blk)%eval(cell_idx, x, vars )
+    end if
+  end function evaluate_reconstruction
+
+end module k_exact_derived_type
 
 ! module k_exact_stencil_derived_type
 !   use set_precision,                only : dp
@@ -3470,6 +4744,7 @@ end module k_exact_cell_derived_type
 ! contains
 !   function constructor( grid, idx, n_nbors, )
 ! end module k_exact_stencil_derived_type
+
 
 module var_rec_cell_derived_type
   use set_precision,                only : dp
@@ -4718,11 +5993,18 @@ contains
   subroutine setup_reconstruction( grid, n_dim, n_vars, degree, rec, eval_fun )
     use grid_derived_type,    only : grid_type
     use var_rec_derived_type, only : var_rec_t
+    use k_exact_derived_type, only : k_exact_t
     use function_holder_type, only : func_h_t
     type(grid_type),           intent(in) :: grid
     integer,                   intent(in)  :: n_dim, n_vars, degree
     type(var_rec_t),           intent(out) :: rec
     class(func_h_t), optional, intent(in)  :: eval_fun
+
+    type(k_exact_t) :: rec2
+
+    
+    rec2 = k_exact_t( grid, n_dim, degree, n_vars, ext_fun=eval_fun )
+
     rec = var_rec_t( grid, n_dim, degree, n_vars, ext_fun=eval_fun )
   end subroutine setup_reconstruction
 

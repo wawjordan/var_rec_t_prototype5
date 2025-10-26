@@ -183,7 +183,7 @@ contains
     integer, dimension(size(array)), optional, intent(out) :: sorted
     integer, dimension(:), optional, intent(inout) :: idx
     integer, dimension(size(array)) :: idx_, sorted_
-    integer :: i, m
+    integer :: m
     m = size(array)
     sorted_ = array
     if ( present(idx) ) then
@@ -211,7 +211,6 @@ contains
     integer, dimension(m), intent(inout) :: A
     integer, dimension(m), intent(inout) :: indx
     integer,               intent(out)   :: marker
-    integer :: return_val
     integer :: i, j
     integer :: temp_indx
     integer :: x, temp_A
@@ -4246,6 +4245,26 @@ pure function compute_grid_moments(this,p,quad) result(moments)
   end do
   moments = moments / sum( quad%quad_wts )
 end function compute_grid_moments
+
+! pure function compute_shifted_moments(this,nbor,p) result(moments)
+!   use set_constants, only : one
+!   class(zero_mean_basis_t), intent(in) :: this, nbor
+!   type(monomial_basis_t),   intent(in) :: p
+!   real(dp), dimension(p%n_terms)       :: moments
+!   real(dp), dimension(p%n_dim) :: xi_tmp, xj_tmp
+!   real(dp), dimension(p%n_dim) :: xi_tmp, xij_alpha
+!   integer :: n, m, coef
+!   associate( xi => this%x_ref, xj => nbor%x_ref, &
+!              hi => this%h_ref, hj => nbor%h_ref )
+!     xj_tmp = this%transform(p%n_dim,xj)
+!     do n = 1,p%n_terms
+!       do m = 1,p%n_terms
+!         call p%eval( term, xj_tmp, B, coef )
+!         p%eval()  ( m,xj,)
+!       end do
+!     end do
+!   end associate
+! end function compute_shifted_moments
 
 pure function evaluate_basis(this,p,term,point) result(B)
   use set_constants, only : one

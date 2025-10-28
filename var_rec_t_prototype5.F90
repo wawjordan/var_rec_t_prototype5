@@ -3460,12 +3460,12 @@ contains
   !     call grid_coarse%gblock(n)%setup(n)
   ! end subroutine coarsen_grid
 
-  ! pure subroutine coarsen_node_coords( lo1, hi1, lo2, hi2, n_skip, coords_in, coords_out )
-  !   integer, dimension(3), intent(in) :: lo1, hi1, lo2, hi2, n_skip
-  !   real(dp), dimension(3,lo1(1):hi1(1),lo1(2):hi1(2),lo1(3):hi1(3)), intent(in)  :: coords_in
-  !   real(dp), dimension(3,lo2(1):hi2(1),lo2(2):hi2(2),lo2(3):hi2(3)), intent(out) :: coords_out
-  !   coords_out = coords_in(:,lo1(1):hi1(1):n_skip(1),lo1(2):hi1(2):n_skip(2),lo1(3):hi1(3):n_skip(3))
-  ! end subroutine coarsen_node_coords
+  pure subroutine coarsen_node_coords( lo1, hi1, lo2, hi2, n_skip, coords_in, coords_out )
+    integer, dimension(3), intent(in) :: lo1, hi1, lo2, hi2, n_skip
+    real(dp), dimension(3,lo1(1):hi1(1),lo1(2):hi1(2),lo1(3):hi1(3)), intent(in)  :: coords_in
+    real(dp), dimension(3,lo2(1):hi2(1),lo2(2):hi2(2),lo2(3):hi2(3)), intent(out) :: coords_out
+    coords_out = coords_in(:,lo1(1):hi1(1):n_skip(1),lo1(2):hi1(2):n_skip(2),lo1(3):hi1(3):n_skip(3))
+  end subroutine coarsen_node_coords
 
   pure function get_cell_nodes(gblock,start_idx,n_skip) result(coords_out)
     type(grid_block),      intent(in) :: gblock
@@ -4303,7 +4303,7 @@ module zero_mean_basis_derived_type
 
 contains
 
-pure function constructor( p, quad, h_ref ) result(this)
+function constructor( p, quad, h_ref ) result(this)
   type(monomial_basis_t), intent(in) :: p
   type(quad_t),           intent(in) :: quad
   real(dp), dimension(:), intent(in) :: h_ref
@@ -4318,6 +4318,7 @@ pure function constructor( p, quad, h_ref ) result(this)
   this%x_ref   = quad%integrate( p%n_dim, quad%quad_pts(1:p%n_dim,:) )         &
                / sum( quad%quad_wts )
   this%moments = this%compute_grid_moments(p,quad)
+  ! this%moments = this%compute_grid_moment([(n,n=1,p%n_terms)],quad)
 end function constructor
 
 pure subroutine destroy_zero_mean_basis_t(this)
@@ -4529,17 +4530,21 @@ end function scaled_basis_derivatives
 
 end module zero_mean_basis_derived_type
 
-module reconstruct_cell_derived_type
+module k_exact_cell_derived_type
   use set_precision,                only : dp
   use monomial_basis_derived_type,  only : monomial_basis_t
   use zero_mean_basis_derived_type, only : zero_mean_basis_t
+  use quadrature_derived_type,      only : quad_t
+
   implicit none
   private
-  public :: rec_cell_t
+  public :: k_exact_cell_t
 
-  type, abstract :: rec_cell_t
+  type :: k_exact_cell_t
     type(zero_mean_basis_t)                 :: basis
     real(dp), dimension(:,:),   allocatable :: coefs
+    real(dp), dimension(:,:),   allocatable :: Ainv
+    real(dp), dimension(:),     allocatable :: col_scale
     integer :: n_vars
     integer :: self_idx
     integer :: self_block
@@ -4547,62 +4552,54 @@ module reconstruct_cell_derived_type
     integer, dimension(:), allocatable :: nbor_block, nbor_idx
   contains
     private
-    procedure, public, pass :: initialize_super
-    procedure, public, pass :: destroy_super
-    procedure(destroy_i), public, pass, deferred :: destroy
-    procedure, public, pass :: eval    => evaluate_reconstruction
-    procedure, public, pass :: set_cell_avg => set_cell_avg_func, set_cell_avg_val
-    procedure, public, pass :: set_cell_coefs, get_cell_error
-  end type rec_cell_t
+    procedure, public, pass :: destroy => destroy_k_exact_cell_t
+    procedure, public, pass :: eval => evaluate_reconstruction
+  end type k_exact_cell_t
 
-  abstract interface
-    pure elemental subroutine destroy_i(this)
-      import rec_cell_t
-      class(rec_cell_t), intent(inout) :: this
-    end subroutine destroy_i
-  end interface
+  interface k_exact_cell_t
+    module procedure constructor
+  end interface k_exact_cell_t
+
 contains
-  pure elemental subroutine destroy_super(this)
-    class(rec_cell_t), intent(inout) :: this
+
+  pure elemental subroutine destroy_k_exact_cell_t(this)
+    class(k_exact_cell_t), intent(inout) :: this
     call this%basis%destroy()
     if ( allocated(this%nbor_block) ) deallocate( this%nbor_block )
     if ( allocated(this%nbor_idx  ) ) deallocate( this%nbor_idx   )
     if ( allocated(this%coefs     ) ) deallocate( this%coefs      )
-    this%n_vars     = 0
+    if ( allocated(this%Ainv      ) ) deallocate( this%Ainv       )
+    if ( allocated(this%col_scale ) ) deallocate( this%col_scale  )
     this%self_idx   = 0
     this%self_block = 0
-    this%n_nbor     = 0
-  end subroutine destroy_super
+    this%n_vars     = 0
+  end subroutine destroy_k_exact_cell_t
 
-  pure subroutine initialize_super( this, p, self_block, self_idx, n_nbor,     &
-                                    nbor_block, nbor_idx, n_vars, quad, h_ref )
-    use set_constants, only : zero
-    use quadrature_derived_type, only : quad_t
-    class(rec_cell_t),      intent(inout) :: this
-    type(monomial_basis_t), intent(in)    :: p
-    integer,                intent(in)    :: self_block, self_idx, n_nbor
-    integer, dimension(:),  intent(in)    :: nbor_block, nbor_idx
-    integer,                intent(in)    :: n_vars
-    type(quad_t),           intent(in)    :: quad
-    real(dp), dimension(:), intent(in)    :: h_ref
-    call this%destroy_super()
-    this%n_vars     = n_vars
-    this%self_idx   = self_idx
-    this%self_block = self_block
-    this%n_nbor     = n_nbor
+  function constructor( p, self_block, self_idx, n_nbor, nbor_block, nbor_idx, n_vars, quad, h_ref ) result(this)
+    use set_constants, only : zero, one
+    type(monomial_basis_t),        intent(in) :: p
+    integer,                       intent(in) :: self_block, self_idx, n_nbor
+    integer, dimension(:),         intent(in) :: nbor_block, nbor_idx
+    integer,                       intent(in) :: n_vars
+    type(quad_t),                  intent(in) :: quad
+    real(dp), dimension(p%n_dim),  intent(in) :: h_ref
+    type(k_exact_cell_t)                      :: this
+    call this%destroy()
     this%basis = zero_mean_basis_t( p, quad, h_ref )
-    allocate( this%nbor_block( n_nbor ) )
-    allocate( this%nbor_idx(   n_nbor ) )
-    allocate( this%coefs( p%n_terms, n_vars ) )
-    this%nbor_block = nbor_block(1:n_nbor)
-    this%nbor_idx   = nbor_idx(1:n_nbor)
-    this%coefs      = zero
-  end subroutine initialize_super
+    this%n_nbor = n_nbor
+    allocate( this%nbor_block( n_nbor ) ); this%nbor_block = nbor_block(1:n_nbor)
+    allocate( this%nbor_idx(   n_nbor ) ); this%nbor_idx   = nbor_idx(1:n_nbor)
+    allocate( this%coefs( p%n_terms  , n_vars ) ); this%coefs = zero
+    allocate( this%Ainv(  p%n_terms-1, n_nbor ) ); this%Ainv  = zero
+    allocate( this%col_scale( p%n_terms-1     ) ); this%col_scale = one
+  end function constructor
+
+  
 
   pure function evaluate_reconstruction( this, p, point, n_terms,              &
                                          n_var, var_idx ) result(val)
     use set_constants, only : zero
-    class(rec_cell_t),          intent(in) :: this
+    class(k_exact_cell_t),      intent(in) :: this
     type(monomial_basis_t),     intent(in) :: p
     real(dp), dimension(:),     intent(in) :: point
     integer,                    intent(in) :: n_terms, n_var
@@ -4619,318 +4616,7 @@ contains
     end do
   end function evaluate_reconstruction
 
-  pure function get_cell_avg(quad,n_dim,n_var,var_idx,eval_fun) result(avg)
-    use set_constants, only : zero
-    use quadrature_derived_type, only : quad_t
-    use function_holder_type,    only : func_h_t
-    type(quad_t),           intent(in) :: quad
-    integer,                intent(in) :: n_dim, n_var
-    integer,  dimension(:), intent(in) :: var_idx
-    class(func_h_t),        intent(in) :: eval_fun
-    real(dp), dimension(n_var)         :: avg
-    real(dp), dimension(n_var,quad%n_quad) :: tmp_val
-    integer :: n
-    tmp_val = zero
-    do n = 1,quad%n_quad
-      tmp_val(:,n) = eval_fun%test_eval( n_dim, n_var, quad%quad_pts(:,n) )
-    end do
-    avg = quad%integrate( n_var, tmp_val ) / sum( quad%quad_wts)
-  end function get_cell_avg
-
-  pure subroutine set_cell_avg_func( this, quad, n_dim, n_var,var_idx,eval_fun)
-    use quadrature_derived_type, only : quad_t
-    use function_holder_type,    only : func_h_t
-    class(rec_cell_t),      intent(inout) :: this
-    type(quad_t),           intent(in)    :: quad
-    integer,                intent(in)    :: n_dim, n_var
-    integer,  dimension(:), intent(in)    :: var_idx
-    class(func_h_t),        intent(in)    :: eval_fun
-    real(dp), dimension(n_var) :: tmp_val
-    integer :: v
-    tmp_val = get_cell_avg( quad, n_dim, n_var, var_idx, eval_fun )
-    do v = 1,n_var
-      this%coefs(1,var_idx(v)) = tmp_val(v)
-    end do
-  end subroutine set_cell_avg_func
-
-  pure subroutine set_cell_coefs( this, n_coef, n_var, coef_idx, var_idx, vals )
-    use function_holder_type,    only : func_h_t
-    class(rec_cell_t),        intent(inout) :: this
-    integer,                  intent(in)    :: n_coef, n_var
-    integer,  dimension(:),   intent(in)    :: coef_idx, var_idx
-    real(dp), dimension(:,:), intent(in)    :: vals
-    integer :: v, n
-    do v = 1,n_var
-      do n = 1,n_coef
-        this%coefs(coef_idx(n),var_idx(v)) = vals(n,v)
-      end do
-    end do
-  end subroutine set_cell_coefs
-
-  pure subroutine set_cell_avg_val( this, n_var, var_idx, var_val )
-    class(rec_cell_t),      intent(inout) :: this
-    integer,                intent(in)    :: n_var
-    integer,  dimension(:), intent(in)    :: var_idx
-    real(dp), dimension(:), intent(in)    :: var_val
-    call this%set_cell_coefs( 1, n_var, [1], var_idx, spread(var_val,1,1) )
-  end subroutine set_cell_avg_val
-
-  pure function get_cell_error( this, p, quad, n_terms, norm, n_var, var_idx, eval_fun ) result(err)
-    use set_constants,           only : zero, one
-    use quadrature_derived_type, only : quad_t
-    use monomial_basis_derived_type, only : monomial_basis_t
-    use function_holder_type,    only : func_h_t
-    class(rec_cell_t),      intent(in) :: this
-    type(monomial_basis_t), intent(in) :: p
-    type(quad_t),           intent(in) :: quad
-    integer,                intent(in) :: n_terms, norm, n_var
-    integer, dimension(:),  intent(in) :: var_idx
-    class(func_h_t),        intent(in)    :: eval_fun
-    real(dp), dimension(n_var)            :: err
-    real(dp), dimension(n_var) :: reconstructed, exact
-    real(dp), dimension(n_var,quad%n_quad) :: tmp_val
-    integer, parameter :: max_L_norm = 10
-    integer :: n
-    tmp_val = zero
-    do n = 1,quad%n_quad
-      exact = eval_fun%test_eval( p%n_dim, n_var, quad%quad_pts(:,n) )
-      reconstructed = this%eval( p, quad%quad_pts(:,n), n_terms, n_var, var_idx )
-      tmp_val(:,n) = abs( reconstructed - exact )
-    end do
-    if (norm>max_L_norm) then
-      err = maxval(tmp_val,dim=2)
-    else
-      err = quad%integrate( size(var_idx), tmp_val**norm )**(one/real(norm,dp))
-      err = err / sum( quad%quad_wts)**(one/real(norm,dp))
-    end if
-  end function get_cell_error
-  
-end module reconstruct_cell_derived_type
-
-module k_exact_cell_derived_type
-  use set_precision,                 only : dp
-  use reconstruct_cell_derived_type, only : rec_cell_t
-
-  implicit none
-  private
-  public :: k_exact_cell_t
-
-  type, extends(rec_cell_t) :: k_exact_cell_t
-    real(dp), dimension(:,:),   allocatable :: Ainv
-    real(dp), dimension(:),     allocatable :: col_scale
-  contains
-    private
-    procedure, public, pass :: destroy => destroy_k_exact_cell_t
-  end type k_exact_cell_t
-
-  interface k_exact_cell_t
-    module procedure constructor
-  end interface k_exact_cell_t
-
-contains
-
-  pure elemental subroutine destroy_k_exact_cell_t(this)
-    class(k_exact_cell_t), intent(inout) :: this
-    call this%destroy_super()
-    if ( allocated(this%Ainv      ) ) deallocate( this%Ainv       )
-    if ( allocated(this%col_scale ) ) deallocate( this%col_scale  )
-  end subroutine destroy_k_exact_cell_t
-
-  pure function constructor( p, self_block, self_idx, n_nbor, nbor_block, nbor_idx, n_vars, quad, h_ref ) result(this)
-    use set_constants,                only : zero, one
-    use monomial_basis_derived_type,  only : monomial_basis_t
-    use zero_mean_basis_derived_type, only : zero_mean_basis_t
-    use quadrature_derived_type,      only : quad_t
-    type(monomial_basis_t),        intent(in) :: p
-    integer,                       intent(in) :: self_block, self_idx, n_nbor
-    integer, dimension(:),         intent(in) :: nbor_block, nbor_idx
-    integer,                       intent(in) :: n_vars
-    type(quad_t),                  intent(in) :: quad
-    real(dp), dimension(p%n_dim),  intent(in) :: h_ref
-    type(k_exact_cell_t)                      :: this
-    call this%initialize_super( p, self_block, self_idx, n_nbor, nbor_block, nbor_idx, n_vars, quad, h_ref )
-    allocate( this%Ainv(  p%n_terms-1, n_nbor ) ); this%Ainv  = zero
-    allocate( this%col_scale( p%n_terms-1     ) ); this%col_scale = one
-  end function constructor
-
 end module k_exact_cell_derived_type
-
-module var_rec_cell_derived_type
-  use set_precision,                only : dp
-  use reconstruct_cell_derived_type, only : rec_cell_t
-  implicit none
-  private
-  public :: var_rec_cell_t
-  type, extends(rec_cell_t) :: var_rec_cell_t
-    ! private
-    integer :: n_interior
-    integer, dimension(:), allocatable      :: face_id
-    real(dp), dimension(:,:),   allocatable :: RHS, A, D, LU, P
-    real(dp), dimension(:,:,:), allocatable :: B, C
-  contains
-    private
-    procedure, public, pass :: destroy => destroy_var_rec_cell_t
-    procedure, public, pass :: get_nbor_contribution
-    procedure, public, pass :: get_self_RHS_contribution
-    procedure, public, pass :: get_nbor_RHS_contribution
-    
-  end type var_rec_cell_t
-
-  interface var_rec_cell_t
-    procedure constructor
-  end interface var_rec_cell_t
-
-contains
-
-  pure elemental subroutine destroy_var_rec_cell_t(this)
-    class(var_rec_cell_t), intent(inout) :: this
-    call this%destroy_super()
-    if ( allocated(this%face_id   ) ) deallocate( this%face_id    )
-    if ( allocated(this%RHS       ) ) deallocate( this%RHS        )
-    if ( allocated(this%A         ) ) deallocate( this%A          )
-    if ( allocated(this%D         ) ) deallocate( this%D          )
-    if ( allocated(this%LU        ) ) deallocate( this%LU         )
-    if ( allocated(this%P         ) ) deallocate( this%P          )
-    if ( allocated(this%B         ) ) deallocate( this%B          )
-    if ( allocated(this%C         ) ) deallocate( this%C          )
-    this%n_interior = 0
-  end subroutine destroy_var_rec_cell_t
-
-  ! pure function constructor( p, self_block, self_idx, n_nbor, nbor_block, nbor_idx, n_vars, quad, h_ref ) result(this)
-  pure function constructor( p, self_block, self_idx, nbor_block, nbor_idx,    &
-                             face_id, n_interior, n_vars, quad, h_ref ) result(this)
-    use set_constants, only : zero
-    use monomial_basis_derived_type,  only : monomial_basis_t
-    use zero_mean_basis_derived_type, only : zero_mean_basis_t
-    use quadrature_derived_type,      only : quad_t
-    type(monomial_basis_t),        intent(in) :: p
-    integer,                       intent(in) :: self_block, self_idx
-    integer, dimension(:),         intent(in) :: nbor_block, nbor_idx, face_id
-    integer,                       intent(in) :: n_interior, n_vars
-    type(quad_t),                  intent(in) :: quad
-    real(dp), dimension(p%n_dim),  intent(in) :: h_ref
-    type(var_rec_cell_t)                      :: this
-    integer :: n_nbor
-    n_nbor = 2*p%n_dim
-    call this%initialize_super( p, self_block, self_idx, n_nbor, nbor_block, nbor_idx, n_vars, quad, h_ref )
-    allocate( this%face_id( n_nbor ) )
-    allocate( this%RHS(p%n_terms-1, n_vars ) )
-    allocate( this%A(  p%n_terms-1, p%n_terms-1 ) )
-    allocate( this%D(  p%n_terms-1, p%n_terms-1 ) )
-    allocate( this%LU( p%n_terms-1, p%n_terms-1 ) )
-    allocate( this%P(  p%n_terms-1, p%n_terms-1 ) )
-    allocate( this%B(  p%n_terms-1, p%n_terms-1, n_interior ) )
-    allocate( this%C(  p%n_terms-1, p%n_terms-1, n_interior ) )
-    this%RHS = zero
-    this%A   = zero
-    this%B   = zero
-    this%C   = zero
-    this%D   = zero
-    this%LU  = zero
-    this%P   = zero
-    this%face_id    = face_id
-    this%n_interior = n_interior
-  end function constructor
-
-  pure subroutine get_nbor_contribution( this, nbor, p, fquad,                 &
-                                         term_start, term_end, A, B, D, C )
-    use set_constants, only : zero, one
-    use quadrature_derived_type,      only : quad_t
-    use monomial_basis_derived_type,  only : monomial_basis_t
-    class(var_rec_cell_t),                        intent(in)  :: this
-    class(var_rec_cell_t),                        intent(in)  :: nbor
-    type(monomial_basis_t),                       intent(in)  :: p
-    class(quad_t),                                intent(in)  :: fquad
-    integer,                                      intent(in)  :: term_start
-    integer,                                      intent(in)  :: term_end
-    real(dp), dimension( term_end - term_start,                                &
-                         term_end - term_start ), intent(out) :: A, B
-    real(dp), dimension( term_end - term_start,                                &
-                                    term_start ), intent(out) :: D, C
-    real(dp), dimension(term_end,term_end) :: d_basis_i
-    real(dp), dimension(term_end,term_end) :: d_basis_j
-    integer :: q, l, m
-    real(dp), dimension(p%n_dim) :: dij
-    real(dp) :: xdij_mag
-
-    A = zero; B = zero; C = zero; D = zero
-    dij = abs( this%basis%x_ref - nbor%basis%x_ref )
-    do q = 1,fquad%n_quad
-      d_basis_i = this%basis%scaled_basis_derivatives( p,                      &
-                                                       0,                      &
-                                                       term_end,               &
-                                                       fquad%quad_pts(:,q),    &
-                                                       dij )
-      d_basis_j = nbor%basis%scaled_basis_derivatives( p,                      &
-                                                       0,                      &
-                                                       term_end,               &
-                                                       fquad%quad_pts(:,q),    &
-                                                       dij )
-      ! LHS
-      do m = 1,term_end-term_start
-        do l = 1,term_end-term_start
-          A(l,m) = A(l,m) + fquad%quad_wts(q)                                  &
-                          * dot_product( d_basis_i(:,l+term_start),            &
-                                         d_basis_i(:,m+term_start) )
-          B(l,m) = B(l,m) + fquad%quad_wts(q)                                  &
-                          * dot_product( d_basis_i(:,l+term_start),            &
-                                         d_basis_j(:,m+term_start) )
-        end do
-      end do
-
-      ! RHS
-      do m = 1,term_start
-        do l = 1,term_end-term_start
-          D(l,m) = D(l,m) + fquad%quad_wts(q)                                  &
-                          * dot_product( d_basis_i(:,l+term_start),            &
-                                         d_basis_i(:,m) )
-          C(l,m) = C(l,m) + fquad%quad_wts(q)                                  &
-                          * dot_product( d_basis_i(:,l+term_start),            &
-                                         d_basis_j(:,m) )
-        end do
-      end do
-    end do
-    xdij_mag = one/norm2(dij)
-    A = A * xdij_mag
-    B = B * xdij_mag
-    C = C * xdij_mag
-    D = D * xdij_mag
-  end subroutine get_nbor_contribution
-
-  pure function get_self_RHS_contribution( this, term_start, term_end,         &
-                                           n_var, var_idx ) result(b)
-    use set_constants, only : zero, one
-    class(var_rec_cell_t),      intent(in) :: this
-    integer,                    intent(in) :: term_start, term_end, n_var
-    integer,  dimension(:),     intent(in) :: var_idx
-    real(dp), dimension( term_end - term_start, n_var ) :: b
-    integer :: n, m, v
-    m = term_end - term_start
-    n = term_start
-    do v = 1,n_var
-      b(:,v) = matmul( this%D(1:m,1:n), this%coefs(1:n,var_idx(v)) )
-    end do
-  end function get_self_RHS_contribution
-
-  pure function get_nbor_RHS_contribution( this, nbor, nbor_id,                &
-                                           term_start, term_end,               &
-                                           n_var, var_idx ) result(b)
-    use set_constants, only : zero, one
-    class(var_rec_cell_t),    intent(in) :: this
-    class(var_rec_cell_t),    intent(in) :: nbor
-    integer,                  intent(in) :: nbor_id, term_start, term_end
-    integer,                  intent(in) :: n_var
-    integer,  dimension(:),   intent(in) :: var_idx
-    real(dp), dimension( term_end - term_start, n_var ) :: b
-    integer :: n, m, v
-    m = term_end - term_start
-    n = term_start
-    do v = 1,n_var
-      b(:,v) = matmul( this%C(1:m,1:n,nbor_id), nbor%coefs(1:n,var_idx(v)) )
-    end do
-  end function get_nbor_RHS_contribution
-
-end module var_rec_cell_derived_type
 
 module k_exact_block_derived_type
   use set_precision,               only : dp
@@ -5360,6 +5046,216 @@ contains
   end function evaluate_reconstruction
 
 end module k_exact_derived_type
+
+module var_rec_cell_derived_type
+  use set_precision,                only : dp
+  use monomial_basis_derived_type,  only : monomial_basis_t
+  use zero_mean_basis_derived_type, only : zero_mean_basis_t
+  use quadrature_derived_type,      only : quad_t
+  implicit none
+  private
+  public :: var_rec_cell_t
+  type :: var_rec_cell_t
+    ! private
+    integer :: n_vars
+    integer :: n_interior
+    integer :: self_idx
+    integer :: self_block
+    integer, dimension(:), allocatable      :: nbor_block, nbor_idx, face_id
+    type(zero_mean_basis_t)                 :: basis
+    real(dp), dimension(:,:),   allocatable :: coefs, RHS
+    real(dp), dimension(:,:),   allocatable :: A, D, LU, P
+    real(dp), dimension(:,:,:), allocatable :: B, C
+  contains
+    private
+    procedure, public, pass :: destroy => destroy_var_rec_cell_t
+    procedure, public, pass :: eval => evaluate_reconstruction
+    procedure, public, pass :: get_nbor_contribution
+    procedure, public, pass :: get_self_RHS_contribution
+    procedure, public, pass :: get_nbor_RHS_contribution
+    
+  end type var_rec_cell_t
+
+  interface var_rec_cell_t
+    procedure constructor
+  end interface var_rec_cell_t
+
+contains
+
+  pure elemental subroutine destroy_var_rec_cell_t(this)
+    class(var_rec_cell_t), intent(inout) :: this
+    call this%basis%destroy()
+    if ( allocated(this%nbor_block) ) deallocate( this%nbor_block )
+    if ( allocated(this%nbor_idx  ) ) deallocate( this%nbor_idx   )
+    if ( allocated(this%face_id   ) ) deallocate( this%face_id    )
+    if ( allocated(this%coefs     ) ) deallocate( this%coefs      )
+    if ( allocated(this%RHS       ) ) deallocate( this%RHS        )
+    if ( allocated(this%A         ) ) deallocate( this%A          )
+    if ( allocated(this%D         ) ) deallocate( this%D          )
+    if ( allocated(this%LU        ) ) deallocate( this%LU         )
+    if ( allocated(this%P         ) ) deallocate( this%P          )
+    if ( allocated(this%B         ) ) deallocate( this%B          )
+    if ( allocated(this%C         ) ) deallocate( this%C          )
+  end subroutine destroy_var_rec_cell_t
+
+  function constructor( p, self_block, self_idx,                               &
+                        nbor_block, nbor_idx, face_id, n_interior,             &
+                        n_vars, quad, h_ref ) result(this)
+    use set_constants, only : zero
+    type(monomial_basis_t),        intent(in) :: p
+    integer,                       intent(in) :: self_block, self_idx
+    integer, dimension(2*p%n_dim), intent(in) :: nbor_block, nbor_idx, face_id
+    integer,                       intent(in) :: n_interior, n_vars
+    type(quad_t),                  intent(in) :: quad
+    real(dp), dimension(p%n_dim),  intent(in) :: h_ref
+    type(var_rec_cell_t)                      :: this
+    call this%destroy()
+    this%basis = zero_mean_basis_t( p, quad, h_ref )
+    allocate( this%nbor_block( 2*p%n_dim ) )
+    allocate( this%nbor_idx(   2*p%n_dim ) )
+    allocate( this%face_id(    2*p%n_dim ) )
+    allocate( this%coefs( p%n_terms, n_vars ) )
+    allocate( this%RHS(p%n_terms-1, n_vars ) )
+    allocate( this%A(  p%n_terms-1, p%n_terms-1 ) )
+    allocate( this%D(  p%n_terms-1, p%n_terms-1 ) )
+    allocate( this%LU( p%n_terms-1, p%n_terms-1 ) )
+    allocate( this%P(  p%n_terms-1, p%n_terms-1 ) )
+    allocate( this%B(  p%n_terms-1, p%n_terms-1, n_interior ) )
+    allocate( this%C(  p%n_terms-1, p%n_terms-1, n_interior ) )
+    this%coefs      = zero
+    this%RHS        = zero
+    this%A = zero
+    this%B = zero
+    this%C = zero
+    this%D = zero
+    this%LU = zero
+    this%P = zero
+    this%self_block = self_block
+    this%self_idx   = self_idx
+    this%nbor_block = nbor_block
+    this%nbor_idx   = nbor_idx
+    this%face_id    = face_id
+    this%n_interior = n_interior
+    this%n_vars     = n_vars
+  end function constructor
+
+  pure function evaluate_reconstruction( this, p, point, n_terms,              &
+                                         n_var, var_idx ) result(val)
+    use set_constants, only : zero
+    class(var_rec_cell_t),      intent(in) :: this
+    type(monomial_basis_t),     intent(in) :: p
+    real(dp), dimension(:),     intent(in) :: point
+    integer,                    intent(in) :: n_terms, n_var
+    integer,  dimension(n_var), intent(in) :: var_idx
+    real(dp), dimension(n_var)             :: val
+    real(dp), dimension(n_terms) :: basis
+    integer :: v, n
+    val = zero
+    do n = 1,n_terms
+      basis(n) = this%basis%eval(p,n,point)
+    end do
+    do v = 1,n_var
+      val(v) = val(v) + dot_product( this%coefs(1:n_terms,var_idx(v)), basis )
+    end do
+  end function evaluate_reconstruction
+
+  pure subroutine get_nbor_contribution( this, nbor, p, fquad,                 &
+                                         term_start, term_end, A, B, D, C )
+    use set_constants, only : zero, one
+    class(var_rec_cell_t),                        intent(in)  :: this
+    class(var_rec_cell_t),                        intent(in)  :: nbor
+    type(monomial_basis_t),                       intent(in)  :: p
+    class(quad_t),                                intent(in)  :: fquad
+    integer,                                      intent(in)  :: term_start
+    integer,                                      intent(in)  :: term_end
+    real(dp), dimension( term_end - term_start,                                &
+                         term_end - term_start ), intent(out) :: A, B
+    real(dp), dimension( term_end - term_start,                                &
+                                    term_start ), intent(out) :: D, C
+    real(dp), dimension(term_end,term_end) :: d_basis_i
+    real(dp), dimension(term_end,term_end) :: d_basis_j
+    integer :: q, l, m
+    real(dp), dimension(p%n_dim) :: dij
+    real(dp) :: xdij_mag
+
+    A = zero; B = zero; C = zero; D = zero
+    dij = abs( this%basis%x_ref - nbor%basis%x_ref )
+    do q = 1,fquad%n_quad
+      d_basis_i = this%basis%scaled_basis_derivatives( p,                      &
+                                                       0,                      &
+                                                       term_end,               &
+                                                       fquad%quad_pts(:,q),    &
+                                                       dij )
+      d_basis_j = nbor%basis%scaled_basis_derivatives( p,                      &
+                                                       0,                      &
+                                                       term_end,               &
+                                                       fquad%quad_pts(:,q),    &
+                                                       dij )
+      ! LHS
+      do m = 1,term_end-term_start
+        do l = 1,term_end-term_start
+          A(l,m) = A(l,m) + fquad%quad_wts(q)                                  &
+                          * dot_product( d_basis_i(:,l+term_start),            &
+                                         d_basis_i(:,m+term_start) )
+          B(l,m) = B(l,m) + fquad%quad_wts(q)                                  &
+                          * dot_product( d_basis_i(:,l+term_start),            &
+                                         d_basis_j(:,m+term_start) )
+        end do
+      end do
+
+      ! RHS
+      do m = 1,term_start
+        do l = 1,term_end-term_start
+          D(l,m) = D(l,m) + fquad%quad_wts(q)                                  &
+                          * dot_product( d_basis_i(:,l+term_start),            &
+                                         d_basis_i(:,m) )
+          C(l,m) = C(l,m) + fquad%quad_wts(q)                                  &
+                          * dot_product( d_basis_i(:,l+term_start),            &
+                                         d_basis_j(:,m) )
+        end do
+      end do
+    end do
+    xdij_mag = one/norm2(dij)
+    A = A * xdij_mag
+    B = B * xdij_mag
+    C = C * xdij_mag
+    D = D * xdij_mag
+  end subroutine get_nbor_contribution
+
+  pure function get_self_RHS_contribution( this, term_start, term_end,         &
+                                           n_var, var_idx ) result(b)
+    use set_constants, only : zero, one
+    class(var_rec_cell_t),      intent(in) :: this
+    integer,                    intent(in) :: term_start, term_end, n_var
+    integer,  dimension(:),     intent(in) :: var_idx
+    real(dp), dimension( term_end - term_start, n_var ) :: b
+    integer :: n, m, v
+    m = term_end - term_start
+    n = term_start
+    do v = 1,n_var
+      b(:,v) = matmul( this%D(1:m,1:n), this%coefs(1:n,var_idx(v)) )
+    end do
+  end function get_self_RHS_contribution
+
+  pure function get_nbor_RHS_contribution( this, nbor, nbor_id,                &
+                                           term_start, term_end,               &
+                                           n_var, var_idx ) result(b)
+    use set_constants, only : zero, one
+    class(var_rec_cell_t),    intent(in) :: this
+    class(var_rec_cell_t),    intent(in) :: nbor
+    integer,                  intent(in) :: nbor_id, term_start, term_end
+    integer,                  intent(in) :: n_var
+    integer,  dimension(:),   intent(in) :: var_idx
+    real(dp), dimension( term_end - term_start, n_var ) :: b
+    integer :: n, m, v
+    m = term_end - term_start
+    n = term_start
+    do v = 1,n_var
+      b(:,v) = matmul( this%C(1:m,1:n,nbor_id), nbor%coefs(1:n,var_idx(v)) )
+    end do
+  end function get_nbor_RHS_contribution
+
+end module var_rec_cell_derived_type
 
 module var_rec_block_derived_type
   use set_precision,               only : dp

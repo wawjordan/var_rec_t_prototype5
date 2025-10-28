@@ -12,7 +12,7 @@ module set_constants
   use set_precision, only : dp
   implicit none
   private
-  public :: zero, one, two, three, four
+  public :: zero, one, two, three, four, ten
   public :: half, third, fourth
   public :: pi, large, near_zero
   public :: max_text_line_length
@@ -21,6 +21,7 @@ module set_constants
   real(dp), parameter :: two       = 2.0_dp
   real(dp), parameter :: three     = 3.0_dp
   real(dp), parameter :: four      = 4.0_dp
+  real(dp), parameter :: ten       = 10.0_dp
   real(dp), parameter :: third     = one / three
   real(dp), parameter :: fourth    = 0.25_dp
   real(dp), parameter :: half      = 0.50_dp
@@ -1383,6 +1384,7 @@ module math
   public :: LegendrePolynomialAndDerivative, LegendreGaussNodesAndWeights
   public :: maximal_diameter, maximal_extents
   public :: rand_int_in_range
+  public :: compute_pseudo_inverse
 
   interface LUsolve
     module procedure LUsolve_single_rhs
@@ -1610,6 +1612,115 @@ contains
     real(dp), dimension(dim) :: d
     d = half*(maxval(points,dim=2) - minval(points,dim=2))
   end function maximal_extents
+
+!=========================== compute_pseudo_inverse ==========================80
+!>
+!! Description: Computes the pseudo-inverse of the reconstruction LHS.
+!!
+!! Inputs:      LHS_m: Extent of reconstruction LHS
+!!              LHS_n: Extent of reconstruction LHS
+!!              LHS:   Reconstruction LHS
+!!
+!! Outputs:     LHS_plus: Pseudo-inverse of reconstruction LHS
+!<
+!=============================================================================80
+  subroutine compute_pseudo_inverse( LHS_m, LHS_n, LHS, LHS_plus )
+
+    use set_precision, only : dp
+    use set_constants, only : zero, one, ten
+
+    external dgesvd
+
+    integer,                          intent(in)  :: LHS_m, LHS_n
+    real(dp), dimension(LHS_m,LHS_n), intent(in)  :: LHS
+    real(dp), dimension(LHS_n,LHS_m), intent(out) :: LHS_plus
+
+    integer :: LDA, LDU, LDVT
+    integer :: max_LHS_extents, min_LHS_extents
+    integer :: LWORK
+    integer :: INFO
+    integer :: i, j
+
+    real(dp) :: machine_precision
+    real(dp) :: abs_tolerance
+    real(dp) :: rel_tolerance
+
+    real(dp), dimension(:),   allocatable :: S
+    real(dp), dimension(:,:), allocatable :: U
+    real(dp), dimension(:,:), allocatable :: VT
+    real(dp), dimension(:),   allocatable :: WORK
+    real(dp), dimension(:),   allocatable :: Sinv
+    real(dp), dimension(:),   allocatable :: V_Sinv
+
+    continue
+
+    ! Setup
+    LHS_plus = zero
+
+    ! Define SVD Parameters
+    LDA   = LHS_m
+    LDU   = LHS_m
+    LDVT  = LHS_n
+
+    max_LHS_extents = max(LHS_m,LHS_n)
+    min_LHS_extents = min(LHS_m,LHS_n)
+
+    LWORK = max( 3*min_LHS_extents + max_LHS_extents, 5*min_LHS_extents )
+
+    ! Allocate Storage for the Singular Value Decomposition
+    allocate( S(min_LHS_extents) )
+    allocate( U(LHS_m,LHS_m) )
+    allocate( VT(LHS_n,LHS_n) )
+    allocate( WORK(LWORK) )
+    allocate( Sinv( min_LHS_extents ) )
+    allocate( V_Sinv( LHS_m ) )
+
+    ! Compute the Singular Value Decomposition of the Reconstruction LHS
+    ! Note: dgesvd = LAPACK routine
+    ! Note: dgesdd makes assumptions about floating point arithmetic.
+    call dgesvd( 'A', 'A', LHS_m, LHS_n, LHS, LDA, S, U, LDU, VT, LDVT,        &
+                 WORK, LWORK, INFO )
+    !call sgesvd( 'A', 'A', LHS_m, LHS_n, LHS, LDA, S, U, LDU, VT, LDVT,        &
+    !             WORK, LWORK, INFO )
+
+    ! Determine Truncation Tolerance
+    machine_precision = (ten)**(-precision(one))
+    abs_tolerance     = sqrt(machine_precision)
+    rel_tolerance     = S(1)*abs_tolerance
+
+    ! Compute Inverse of Singular Values
+    Sinv = zero
+
+    do i = 1, min_LHS_extents
+      if ( S(i) <= rel_tolerance ) then
+        ! Truncate Singular Value
+        Sinv(i) = zero
+      else
+        Sinv(i) = one/S(i)
+      end if
+    end do
+
+    ! Compute Pseudo-Inverse
+    do i = 1, LHS_n
+      V_Sinv = zero
+      do j = 1, LHS_n
+        V_Sinv(j) = VT(j,i)*Sinv(j)
+      end do
+
+      do j = 1, LHS_m
+        LHS_plus(i,j) = dot_product( V_Sinv, U(j,:) )
+      end do
+    end do
+
+    ! Deallocate Storage
+    deallocate( S      )
+    deallocate( U      )
+    deallocate( VT     )
+    deallocate( WORK   )
+    deallocate( Sinv   )
+    deallocate( V_Sinv )
+
+  end subroutine compute_pseudo_inverse
 
 end module math
 
@@ -4176,7 +4287,7 @@ module zero_mean_basis_derived_type
     private
     procedure, pass :: compute_grid_moments
     procedure, pass :: transform
-    
+    procedure, public, pass :: shift_moments => compute_shifted_moments, compute_shifted_moments_quad
     procedure, nopass       :: length_scale  => get_length_scale_vector
     procedure, public, pass :: eval  => evaluate_basis
     procedure, public, pass :: deval => evaluate_basis_derivative
@@ -4246,25 +4357,83 @@ pure function compute_grid_moments(this,p,quad) result(moments)
   moments = moments / sum( quad%quad_wts )
 end function compute_grid_moments
 
-! pure function compute_shifted_moments(this,nbor,p) result(moments)
-!   use set_constants, only : one
-!   class(zero_mean_basis_t), intent(in) :: this, nbor
-!   type(monomial_basis_t),   intent(in) :: p
-!   real(dp), dimension(p%n_terms)       :: moments
-!   real(dp), dimension(p%n_dim) :: xi_tmp, xj_tmp
-!   real(dp), dimension(p%n_dim) :: xi_tmp, xij_alpha
-!   integer :: n, m, coef
-!   associate( xi => this%x_ref, xj => nbor%x_ref, &
-!              hi => this%h_ref, hj => nbor%h_ref )
-!     xj_tmp = this%transform(p%n_dim,xj)
-!     do n = 1,p%n_terms
-!       do m = 1,p%n_terms
-!         call p%eval( term, xj_tmp, B, coef )
-!         p%eval()  ( m,xj,)
-!       end do
-!     end do
-!   end associate
-! end function compute_shifted_moments
+pure function compute_shifted_moments(this,p,nbor) result(moments)
+  use set_constants,                only : one, zero
+  use message,                      only : error_message
+  use combinatorics,                only : nchoosek
+  class(zero_mean_basis_t), intent(in) :: this
+  type(monomial_basis_t),   intent(in) :: p
+  class(zero_mean_basis_t), intent(in) :: nbor
+  real(dp), dimension(p%n_terms)       :: moments
+  real(dp), dimension(p%n_dim) :: xi_tmp, xj_tmp
+  real(dp), dimension(p%n_dim,0:p%total_degree) :: delta1, delta2
+  integer,  dimension(p%n_dim) :: alpha, beta, shift_exp
+  integer :: n, m, d, shift_row
+  integer :: comb_factor
+  real(dp) :: grid_factor
+  logical :: err, found_exp
+
+  moments = zero
+
+  ! first, compute all the needed point terms
+  delta1      = zero
+  delta1(:,0) = one
+  delta1(:,1) = this%transform( p%n_dim, nbor%x_ref )
+  delta2      = zero
+  delta2(:,0) = one
+  delta2(:,1) = nbor%h_ref / this%h_ref
+  do m = 2,p%total_degree
+    delta1(:,m) = delta1(:,m-1) * delta1(:,1)
+    delta2(:,m) = delta2(:,m-1) * delta2(:,1)
+  end do
+
+  ! now, loop through, computing the shifted moments
+  do n = 1,p%n_terms
+    alpha = p%exponents(:,n)
+    do m = 1,n
+      beta = p%exponents(:,m)
+      if (any( ( alpha - beta) < 0 ) ) cycle
+
+      shift_exp = alpha - beta
+      comb_factor = 1
+      grid_factor = one
+      do d = 1,p%n_dim
+        comb_factor = comb_factor * nchoosek( alpha(d), beta(d) )
+        grid_factor = grid_factor * delta1( d, beta(d) ) * delta2( d, shift_exp(d) )
+      end do
+
+      ! Find corresponding moment for shift_exp
+      found_exp = .false.
+      do shift_row = 1,p%n_terms
+        found_exp = all( p%exponents(:,shift_row) == shift_exp )
+        if ( found_exp ) exit
+      end do
+
+      ! Moment Hat
+      moments(n) = moments(n) + real(comb_factor,dp) * grid_factor * nbor%moments(shift_row)
+    end do
+    ! remove the 
+    moments(n) = moments(n) - this%moments(n)
+  end do
+end function compute_shifted_moments
+
+pure function compute_shifted_moments_quad(this,p,quad) result(moments)
+  use set_constants, only : zero, one
+  class(zero_mean_basis_t), intent(in) :: this
+  type(monomial_basis_t),   intent(in) :: p
+  type(quad_t),             intent(in) :: quad
+  real(dp), dimension(p%n_terms)       :: moments
+  real(dp), dimension(quad%n_quad)         :: tmp
+  integer :: n, q
+  moments = zero
+  do n = 2,p%n_terms
+    do q = 1,quad%n_quad
+      tmp(q) = this%eval(p,n,quad%quad_pts(:,q))
+    end do
+    moments(n) = quad%integrate(tmp)
+  end do
+  moments = moments / sum( quad%quad_wts )
+end function compute_shifted_moments_quad
 
 pure function evaluate_basis(this,p,term,point) result(B)
   use set_constants, only : one
@@ -4375,6 +4544,7 @@ module k_exact_cell_derived_type
     type(zero_mean_basis_t)                 :: basis
     real(dp), dimension(:,:),   allocatable :: coefs
     real(dp), dimension(:,:),   allocatable :: Ainv
+    real(dp), dimension(:),     allocatable :: col_scale
     integer :: n_vars
     integer :: self_idx
     integer :: self_block
@@ -4399,16 +4569,14 @@ contains
     if ( allocated(this%nbor_idx  ) ) deallocate( this%nbor_idx   )
     if ( allocated(this%coefs     ) ) deallocate( this%coefs      )
     if ( allocated(this%Ainv      ) ) deallocate( this%Ainv       )
+    if ( allocated(this%col_scale ) ) deallocate( this%col_scale  )
     this%self_idx   = 0
     this%self_block = 0
     this%n_vars     = 0
   end subroutine destroy_k_exact_cell_t
 
   function constructor( p, self_block, self_idx, n_nbor, nbor_block, nbor_idx, n_vars, quad, h_ref ) result(this)
-    ! function constructor( p, self_block, self_idx,                               &
-    !                     nbor_block, nbor_idx, face_id, n_interior,             &
-    !                     n_vars, quad, h_ref ) result(this)
-    use set_constants, only : zero
+    use set_constants, only : zero, one
     type(monomial_basis_t),        intent(in) :: p
     integer,                       intent(in) :: self_block, self_idx, n_nbor
     integer, dimension(:),         intent(in) :: nbor_block, nbor_idx
@@ -4421,9 +4589,12 @@ contains
     this%n_nbor = n_nbor
     allocate( this%nbor_block( n_nbor ) ); this%nbor_block = nbor_block(1:n_nbor)
     allocate( this%nbor_idx(   n_nbor ) ); this%nbor_idx   = nbor_idx(1:n_nbor)
-    allocate( this%coefs( p%n_terms, n_vars ) )
-    allocate( this%Ainv(  p%n_terms-1, n_nbor+1 ) )
+    allocate( this%coefs( p%n_terms  , n_vars ) ); this%coefs = zero
+    allocate( this%Ainv(  p%n_terms-1, n_nbor ) ); this%Ainv  = zero
+    allocate( this%col_scale( p%n_terms-1     ) ); this%col_scale = one
   end function constructor
+
+  
 
   pure function evaluate_reconstruction( this, p, point, n_terms,              &
                                          n_var, var_idx ) result(val)
@@ -4462,8 +4633,9 @@ module k_exact_block_derived_type
     type(monomial_basis_t), public :: p
   contains
     private
+    procedure,         pass :: get_cell_LHS, get_cell_RHS
     procedure, public, pass :: destroy => destroy_k_exact_block_t
-    ! procedure, public, pass :: solve   => perform_iterative_reconstruction_SOR
+    procedure, public, pass :: solve   => solve_k_exact_block
     procedure, public, pass :: eval    => evaluate_block_rec_cell
     procedure, public, pass :: set_cell_avgs, init_cells
   end type k_exact_block_t
@@ -4532,14 +4704,14 @@ contains
       idx_tmp(1:n_dim) = global2local_bnd( n, lo(1:n_dim), hi1(1:n_dim) )
 
       call grow_stencil_basic( block_num, idx_tmp, hi1, sz, idx_list )
-      n_nbors = size(idx_list,1)
+      n_nbors = size(idx_list,1) - 1 ! don't include the central cell
       allocate( idx_list_lin( n_nbors ) )
       ! stencil%idx(1)   = block_id
       ! stencil%idx(2:4) = idx
       ! idx_list(i,:) = stencil(i)%idx
 
       do i = 1, n_nbors
-        idx_list_lin(i) = local2global_bnd( idx_list(i,2:4),lo,hi1)
+        idx_list_lin(i) = local2global_bnd( idx_list(i+1,2:4),lo,hi1)
       end do
       nbor_block = block_num
       nodes = pack_cell_node_coords( idx_tmp, lo, hi2, n_skip,                 &
@@ -4552,7 +4724,7 @@ contains
                                         block_num,                             &
                                         n,                                     &
                                         n_nbors,                               &
-                                        idx_list(:,1),                         &
+                                        idx_list(2:,1),                        &
                                         idx_list_lin,                          &
                                         n_var,                                 &
                                         quad,                                  &
@@ -4629,22 +4801,103 @@ contains
     end do
   end subroutine set_cell_avgs
 
-  subroutine init_cells(this,grid,term_start,term_end,n_var,var_idx)
-    use grid_derived_type, only : grid_type 
+  pure subroutine get_cell_LHS( this, lin_idx, term_end, LHS_m, LHS_n, LHS, scale, col_scale )
+    use set_constants, only : zero, one
+    class(k_exact_block_t),   intent(in)  :: this
+    integer,                  intent(in)  :: lin_idx, term_end
+    integer,                  intent(out) :: LHS_m, LHS_n
+    real(dp), dimension(:,:), intent(out) :: LHS
+    logical, optional,        intent(in)  :: scale
+    real(dp), dimension(term_end-1), optional, intent(out) :: col_scale
+    real(dp), dimension(this%p%n_terms) :: shifted_moments
+    logical :: scale_
+    integer :: i, j
+    scale_ = .true.
+    if ( present(scale) ) scale_ = scale
+    if ( .not. present(col_scale) ) scale_ = .false.
+
+    i = lin_idx
+    LHS_m = this%cells(i)%n_nbor
+    LHS_n = term_end - 1
+    LHS = zero
+    do j = 1,LHS_m
+      ! compute_shifted_moments(this,p,nbor)
+      shifted_moments = this%cells(i)%basis%shift_moments( this%p, this%cells( this%cells(i)%nbor_idx(j) )%basis )
+      LHS(j,1:LHS_n) = shifted_moments(2:term_end)
+    end do
+
+    if ( scale_ ) then
+      ! Determine Scaling Factor
+      do i = 1, LHS_n
+        col_scale(i) = sum( abs(LHS(1:LHS_m,i)) )
+      end do
+      col_scale = one / col_scale
+
+      ! Scale the Matrix
+      do i = 1, LHS_n
+        LHS(1:LHS_m,i) = LHS(1:LHS_m,i) * col_scale(i)
+      end do
+    end if
+
+  end subroutine get_cell_LHS
+
+  pure subroutine get_cell_RHS( this, lin_idx, n_vars, var_idx, n_nbors, RHS )
+    class(k_exact_block_t), intent(in)  :: this
+    integer,                intent(in)  :: lin_idx, n_vars
+    integer, dimension(:),  intent(in)  :: var_idx
+    integer,                intent(out) :: n_nbors
+    real(dp), dimension(:,:), intent(out) :: RHS
+    integer :: i, j, k, v
+    i = lin_idx
+    n_nbors = this%cells(i)%n_nbor
+    do k = 1,n_nbors
+      j = this%cells(i)%nbor_idx(k)
+      do v = 1,n_vars
+        RHS(k,var_idx(v)) = this%cells(j)%coefs(1,var_idx(v))
+      end do
+    end do
+  end subroutine get_cell_RHS
+
+  subroutine init_cells(this,grid,term_end,scale)
+    use grid_derived_type, only : grid_type
     use string_stuff,      only : progress_line
+    use math,              only : compute_pseudo_inverse
     class(k_exact_block_t), intent(inout) :: this
     type(grid_type),        intent(in)    :: grid
-    integer,                intent(in)    :: term_start, term_end, n_var
-    integer, dimension(:),  intent(in)    :: var_idx
-    integer :: n
-    do n = 1,this%n_cells_total
-      call progress_line('initializing cell ',n,this%n_cells_total)
-      ! call this%get_cell_LHS( grid, n, term_start, term_end )
-      ! this%cells(n)%RHS = this%get_cell_RHS( n, term_start, term_end,          &
-      !                                        n_var, var_idx )
+    integer,                intent(in)    :: term_end
+    logical, optional,      intent(in)    :: scale
+    real(dp), dimension(:,:), allocatable :: LHS
+    integer :: i, n, m
+    m = maxval(this%cells%n_nbor)
+    n = this%p%n_terms
+    allocate( LHS(m,n) )
+    do i = 1,this%n_cells_total
+      call progress_line('initializing cell ',i,this%n_cells_total)
+      call this%get_cell_LHS( i, term_end, m, n, LHS, scale=scale, col_scale=this%cells(i)%col_scale(1:term_end-1) )
+      call compute_pseudo_inverse( m, n, LHS(1:m,1:n), this%cells(i)%Ainv(1:n,1:m) )
     end do
-    write(*,*)
+    deallocate( LHS )
   end subroutine init_cells
+
+  pure subroutine solve_k_exact_block( this, term_end, n_var, var_idx )
+    use set_constants, only : zero
+    class(k_exact_block_t), intent(inout) :: this
+    integer,                intent(in)    :: term_end, n_var
+    integer, dimension(:),  intent(in)    :: var_idx
+    real(dp), dimension(:,:), allocatable :: RHS
+    integer :: i, n, max_nbors, n_nbors, v
+    max_nbors = maxval(this%cells%n_nbor)
+    allocate( RHS(max_nbors,n_var) )
+    do i = 1,this%n_cells_total
+      call this%get_cell_RHS(i,n_var,var_idx,n_nbors,RHS)
+      do v = 1,n_var
+        do n = 2,term_end
+          this%cells(i)%coefs(n,var_idx(v)) = this%cells(i)%col_scale(n-1)*dot_product( this%cells(i)%Ainv(n-1,:),RHS(1:n_nbors,v) )
+        end do
+      end do
+    end do
+    deallocate( RHS )
+  end subroutine solve_k_exact_block
 
 end module k_exact_block_derived_type
 
@@ -4663,7 +4916,7 @@ module k_exact_derived_type
   contains
     private
     procedure, public, pass :: destroy => destroy_k_exact_t
-    ! procedure, public, pass :: solve   => iterative_solve
+    procedure, public, pass :: solve   => solve_k_exact
     procedure, public, pass :: eval    => evaluate_reconstruction
   end type k_exact_t
 
@@ -4706,6 +4959,7 @@ contains
     allocate( this%b(this%n_blocks) )
     do i = 1,this%n_blocks
       this%b(i) = k_exact_block_t( grid, i, n_dim, degree, n_vars )
+      call this%b(i)%init_cells( grid, this%b(i)%p%n_terms, scale=.true.)
     end do
 
     if ( present(ext_fun) ) then
@@ -4715,6 +4969,61 @@ contains
       end do
     end if
   end function constructor
+
+  subroutine solve_k_exact( this, grid, ext_fun, final_degree, ramp )
+    use grid_derived_type, only : grid_type
+    use function_holder_type, only : func_h_t
+    use combinatorics,        only : nchoosek
+    class(k_exact_t),          intent(inout) :: this
+    type(grid_type),           intent(in)    :: grid
+    class(func_h_t), optional, intent(in)    :: ext_fun
+    integer,         optional, intent(in)    :: final_degree
+    logical,         optional, intent(in)    :: ramp
+    integer :: i, blk, n, v
+    integer :: term_start, term_end, degree_start, degree_end, n_vars
+
+    degree_start = this%degree
+    degree_end   = this%degree
+    n_vars = this%n_vars
+    
+    if ( present( final_degree ) ) degree_end = final_degree
+    if ( present( ramp) ) then
+      if ( ramp ) degree_start = 1
+    end if
+
+    do i = degree_start, degree_end
+      term_start = 1
+      term_end   = nchoosek( this%n_dim + i, i )
+      ! term_end = this%b(blk)%p%idx
+      write(*,'(A,I0)') "reconstructing: p=",i 
+      do blk = 1, this%n_blocks
+        call this%b(blk)%init_cells( grid, term_end, scale=.true. )
+        call this%b(blk)%solve( term_end, n_vars, [(n,n=1,n_vars)] )
+        ! if ( present(ext_fun) ) then
+        !   error_norms = this%b(blk)%get_error_norm( grid%gblock(blk),         &
+        !                                             [(n,n=1,n_vars)],         &
+        !                                             term_end,                 &
+        !                                             [1,2,huge(1)],            &
+        !                                             ext_fun )
+        !   write(*,'(A,I0,A)') 'Block ', blk, ' error norms: '
+        !   do v = 1,n_vars
+        !     write(*,'(I0,3(" ",ES18.12))') v, (error_norms(v,n), n = 1,3)
+        !   end do
+        ! end if
+        ! if (present(soln_name)) then
+        !   call output_block_reconstruction( grid%gblock(blk), this%b(blk),   &
+        !                                     blk, soln_name, old,             &
+        !                                     quad_order=quad_order,           &
+        !                                     ext_fun=ext_fun,                 &
+        !                                     rec_out=.true.,                  &
+        !                                     ext_out=.true.,                  &
+        !                                     err_out=.true.,                  &
+        !                                     solution_time=real(i,dp) )
+        ! end if
+
+      end do
+    end do
+  end subroutine solve_k_exact
 
   pure function evaluate_reconstruction( this, blk, cell_idx,                  &
                                          x, vars, n_terms ) result(val)
@@ -4737,33 +5046,6 @@ contains
   end function evaluate_reconstruction
 
 end module k_exact_derived_type
-
-! module k_exact_stencil_derived_type
-!   use set_precision,                only : dp
-!   use monomial_basis_derived_type,  only : monomial_basis_t
-!   use zero_mean_basis_derived_type, only : zero_mean_basis_t
- 
-
-!   implicit none
-!   private
-!   ! public :: k_exact_cell_t
-!   type :: k_exact_stencil_t
-!     integer :: n_vars
-!     integer :: self_idx
-!     integer :: self_block
-!     integer, dimension(:), allocatable :: nbor_block, nbor_idx
-!   contains
-!     private
-!     procedure, public, pass :: destroy => destroy_k_exact_stencil_t
-!   end type
-
-!   interface k_exact_stencil_t
-!     module procedure constructor
-!   end interface k_exact_stencil_t
-! contains
-!   function constructor( grid, idx, n_nbors, )
-! end module k_exact_stencil_derived_type
-
 
 module var_rec_cell_derived_type
   use set_precision,                only : dp
@@ -5930,7 +6212,7 @@ module test_problem
   implicit none
   private
   ! public :: setup_grid_and_rec_2
-  public :: setup_grid, setup_reconstruction
+  public :: setup_grid, setup_reconstruction1, setup_reconstruction2
   public :: geom_space_wrapper
   interface setup_grid
     module procedure setup_grid_generate
@@ -6009,23 +6291,29 @@ contains
 
   ! end subroutine setup_grid_read
 
-  subroutine setup_reconstruction( grid, n_dim, n_vars, degree, rec, eval_fun )
+  subroutine setup_reconstruction1( grid, n_dim, n_vars, degree, rec, eval_fun )
     use grid_derived_type,    only : grid_type
     use var_rec_derived_type, only : var_rec_t
-    use k_exact_derived_type, only : k_exact_t
     use function_holder_type, only : func_h_t
     type(grid_type),           intent(in) :: grid
     integer,                   intent(in)  :: n_dim, n_vars, degree
     type(var_rec_t),           intent(out) :: rec
     class(func_h_t), optional, intent(in)  :: eval_fun
 
-    type(k_exact_t) :: rec2
-
-    
-    rec2 = k_exact_t( grid, n_dim, degree, n_vars, ext_fun=eval_fun )
-
     rec = var_rec_t( grid, n_dim, degree, n_vars, ext_fun=eval_fun )
-  end subroutine setup_reconstruction
+  end subroutine setup_reconstruction1
+
+  subroutine setup_reconstruction2( grid, n_dim, n_vars, degree, rec, eval_fun )
+    use grid_derived_type,    only : grid_type
+    use k_exact_derived_type, only : k_exact_t
+    use function_holder_type, only : func_h_t
+    type(grid_type),           intent(in) :: grid
+    integer,                   intent(in)  :: n_dim, n_vars, degree
+    type(k_exact_t),           intent(out) :: rec
+    class(func_h_t), optional, intent(in)  :: eval_fun
+
+    rec = k_exact_t( grid, n_dim, degree, n_vars, ext_fun=eval_fun )
+  end subroutine setup_reconstruction2
 
   ! subroutine run_grid_convergence(grid,n_dim,n_levels,coarsen_factor,n_vars,degree,eval_fun,result_file)
   !   use grid_derived_type,    only : grid_type
@@ -6055,10 +6343,10 @@ end module test_problem
 program main
   use set_precision, only : dp
   use set_constants, only : zero, one
-  use test_problem,  only : setup_grid, setup_reconstruction, geom_space_wrapper
+  use test_problem,  only : setup_grid, setup_reconstruction1, setup_reconstruction2, geom_space_wrapper
   use grid_derived_type, only : grid_type
-  use var_rec_block_derived_type, only : var_rec_block_t
   use var_rec_derived_type, only : var_rec_t
+  use k_exact_derived_type, only : k_exact_t
   use timer_derived_type, only : basic_timer_t
   use function_holder_type, only : func_h_t
   use cross_term_sinusoid,  only : cts_t
@@ -6066,7 +6354,8 @@ program main
   implicit none
 
   type(grid_type) :: grid
-  type(var_rec_t) :: rec
+  type(var_rec_t) :: rec1
+  type(k_exact_t) :: rec2
   class(func_h_t), allocatable :: eval_fun
   type(basic_timer_t) :: timer
   integer :: degree, n_vars, n_dim
@@ -6090,12 +6379,22 @@ program main
   space_origin(1:2,1) = 0.5_dp
   allocate( eval_fun, source=cts_t(n_dim,n_vars,rand_coefs=.true.,space_scale=space_scale, space_origin=space_origin) )
 
-  call timer%tic()
+  
   call setup_grid( n_dim, n_nodes, n_ghost, grid, delta=0.3_dp )!, x2_map=geom_space_wrapper )
-  call setup_reconstruction( grid, n_dim, n_vars, degree, rec, eval_fun=eval_fun )
-  call rec%solve( grid,ext_fun=eval_fun,ramp=.true.,tol=1.0e-10_dp,n_iter=1000,soln_name='test',output_quad_order=12)
+  
+  call timer%tic()
+  call setup_reconstruction1( grid, n_dim, n_vars, degree, rec1, eval_fun=eval_fun )
+  ! call rec1%solve( grid,ext_fun=eval_fun,ramp=.true.,tol=1.0e-10_dp,n_iter=1000,soln_name='test',output_quad_order=12)
+  call rec1%solve( grid,ext_fun=eval_fun,ramp=.true.,tol=1.0e-10_dp,n_iter=1000)
   write(*,*) 'Elapsed time: ', timer%toc()
-  call rec%destroy()
+
+  call timer%tic()
+  call setup_reconstruction2( grid, n_dim, n_vars, degree, rec2, eval_fun=eval_fun )
+  call rec2%solve( grid,ext_fun=eval_fun,ramp=.true.)
+  write(*,*) 'Elapsed time: ', timer%toc()
+
+  call rec1%destroy()
+  call rec2%destroy()
   
   call grid%destroy()
   call eval_fun%destroy()
